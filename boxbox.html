@@ -445,11 +445,11 @@ function makeBoxMesh(sx, sy, sz, color) {
     mesh.userData.halfExtents = new THREE.Vector3(sx/2, sy/2, sz/2);
     return mesh;
 }
-const meshA = makeBoxMesh(2, 2, 2, 0x4488ff);
+const meshA = makeBoxMesh(50, 2, 50, 0x4488ff);
 const meshB = makeBoxMesh(1.6, 2.4, 1.2, 0xff8844);
 meshA.position.set(0,0,0);
-meshB.position.set(1.4, 1.1, 0.5);
-meshB.rotation.set(0.4, 0.7, 0.3);
+meshB.position.set(1.4, 4, 0.5);
+// meshB.rotation.set(0.4, 0.7, 0.3);
 
 // --- Debug visuals ---------------------------------------------------------
 const contactGroup = new THREE.Group();

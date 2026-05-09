@@ -188,7 +188,8 @@ for (const n of [6,5,5,4,4,3,2,2,1,1])
     spawnBlock((Math.random()-.5)*6, 4+idx*1.4, (Math.random()-.5)*3, 0.5+Math.random()*0.6);
 
 /* ── SAT OBB vs OBB (Gottschalk — up to 4 contacts) ── */
-const SAT_EPS = 1e-6;
+// const SAT_EPS = 1e-6;
+const SAT_EPS = 1e-3;
 
 function satOBB(a, b) {
   const hwA=a.w/2, hhA=a.h/2, hdA=a.d/2;
@@ -612,8 +613,12 @@ function animate() {
 animate();
 
 renderer.domElement.addEventListener('click', () => {
-  spawnBlock((Math.random()-.5)*8, 10+Math.random()*6, (Math.random()-.5)*4, 0.5+Math.random()*0.6);
+  // spawnBlock((Math.random()-.5)*8, 10+Math.random()*6, (Math.random()-.5)*4, 0.5+Math.random()*0.6);
 });
+
+window.addEventListener('keydown',function(e){
+  if(e.code==='Space'){e.preventDefault();spawnBlock((Math.random()-.5)*8, 10+Math.random()*6, (Math.random()-.5)*4, 0.5+Math.random()*0.6);}
+  });
 
 window.addEventListener('resize', () => {
   camera.aspect = innerWidth/innerHeight;
