@@ -189,7 +189,7 @@ for (const n of [6,5,5,4,4,3,2,2,1,1])
 
 /* ── SAT OBB vs OBB (Gottschalk — up to 4 contacts) ── */
 // const SAT_EPS = 1e-6;
-const SAT_EPS = 1e-3;
+const SAT_EPS = 5e-4;
 
 function satOBB(a, b) {
   const hwA=a.w/2, hhA=a.h/2, hdA=a.d/2;
