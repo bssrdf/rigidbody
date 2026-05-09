@@ -1,0 +1,1756 @@
+Bo<!--
+  Nudge-inspired Rigid Body Dynamics Solver
+  Based on the nudge physics engine by Rasmus Barringer (MIT License)
+  Implemented in JavaScript + Three.js
+
+  Key concepts ported from nudge.cpp/nudge.h:
+  - Body data: Transform (position + quaternion), BodyMomentum (velocity + angular_velocity),
+               BodyProperties (mass_inverse, inertia_inverse), idle_counters for sleeping
+  - Box and Sphere colliders with local transforms
+  - Contact: position, penetration, normal, friction
+  - Collision detection: AABB broadphase, sphere-sphere, box-sphere, box-box (SAT) narrowphase
+  - Sequential impulse solver with warm-starting, friction cone, position correction bias
+  - Semi-implicit Euler integration with quaternion update + normalization
+  - Contact cache for warm-starting impulses across frames
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nudge Rigid Body Dynamics</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #000; font-family: monospace; }
+  canvas { display: block; }
+  #info {
+    position: absolute; top: 10px; left: 10px; color: #fff;
+    background: rgba(0,0,0,0.6); padding: 10px; border-radius: 4px;
+    font-size: 13px; pointer-events: none; line-height: 1.5;
+  }
+  #controls {
+    position: absolute; top: 10px; right: 10px; color: #fff;
+    background: rgba(0,0,0,0.6); padding: 10px; border-radius: 4px;
+    font-size: 12px; display: flex; flex-direction: column; gap: 6px;
+  }
+  #controls button {
+    background: #333; color: #fff; border: 1px solid #555;
+    padding: 6px 12px; cursor: pointer; border-radius: 3px; font-family: monospace;
+  }
+  #controls button:hover { background: #555; }
+</style>
+</head>
+<body>
+<div id="info">
+  <div><strong>Nudge Physics</strong> - Rigid Body Dynamics</div>
+  <div>Bodies: <span id="bodyCount">0</span> | Contacts: <span id="contactCount">0</span></div>
+  <div>FPS: <span id="fps">0</span></div>
+</div>
+<div id="controls">
+  <button onclick="addBoxes()">+ Boxes</button>
+  <button onclick="addSpheres()">+ Spheres</button>
+  <button onclick="resetScene()">Reset</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ============================================================================
+// Math Utilities (Quaternion, Vector3 operations)
+// ============================================================================
+
+const Vec3 = {
+  create: (x=0, y=0, z=0) => ({x, y, z}),
+  copy: (a) => ({x: a.x, y: a.y, z: a.z}),
+  set: (a, x, y, z) => { a.x=x; a.y=y; a.z=z; return a; },
+  add: (a, b) => ({x: a.x+b.x, y: a.y+b.y, z: a.z+b.z}),
+  sub: (a, b) => ({x: a.x-b.x, y: a.y-b.y, z: a.z-b.z}),
+  scale: (a, s) => ({x: a.x*s, y: a.y*s, z: a.z*s}),
+  dot: (a, b) => a.x*b.x + a.y*b.y + a.z*b.z,
+  cross: (a, b) => ({
+    x: a.y*b.z - a.z*b.y,
+    y: a.z*b.x - a.x*b.z,
+    z: a.x*b.y - a.y*b.x
+  }),
+  length: (a) => Math.sqrt(a.x*a.x + a.y*a.y + a.z*a.z),
+  lengthSq: (a) => a.x*a.x + a.y*a.y + a.z*a.z,
+  abs: (a) => ({x: Math.abs(a.x), y: Math.abs(a.y), z: Math.abs(a.z)}),
+  negate: (a) => ({x: -a.x, y: -a.y, z: -a.z}),
+  normalize: (a) => {
+    const len = Vec3.length(a);
+    if (len < 1e-6) return {x:0,y:0,z:0};
+    return {x: a.x/len, y: a.y/len, z: a.z/len};
+  },
+};
+
+const Quat = {
+  identity: () => ({x: 0, y: 0, z: 0, w: 1}),
+  copy: (a) => ({x: a.x, y: a.y, z: a.z, w: a.w}),
+  conjugate: (a) => ({x: -a.x, y: -a.y, z: -a.z, w: a.w}),
+  multiply: (a, b) => ({
+    x: b.w*a.x + b.x*a.w + b.y*a.z - b.z*a.y,
+    y: b.w*a.y + b.y*a.w + b.z*a.x - b.x*a.z,
+    z: b.w*a.z + b.z*a.w + b.x*a.y - b.y*a.x,
+    w: b.w*a.w - b.x*a.x - b.y*a.y - b.z*a.z,
+  }),
+  rotateVec: (q, v) => {
+    // q * (0,v) * q_conjugate, optimized form from nudge:
+    const t = Vec3.cross({x:q.x,y:q.y,z:q.z}, v);
+    const t2 = Vec3.scale(t, 2);
+    const ct = Vec3.cross({x:q.x,y:q.y,z:q.z}, t2);
+    return {
+      x: v.x + q.w*t2.x + ct.x,
+      y: v.y + q.w*t2.y + ct.y,
+      z: v.z + q.w*t2.z + ct.z,
+    };
+  },
+  normalize: (q) => {
+    const len = Math.sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    const inv = 1.0 / len;
+    return {x: q.x*inv, y: q.y*inv, z: q.z*inv, w: q.w*inv};
+  },
+  toMatrix3: (q) => {
+    // Build 3x3 rotation matrix from quaternion (same as nudge matrix())
+    const kx = q.x + q.x, ky = q.y + q.y, kz = q.z + q.z;
+    const xx = kx*q.x, yy = ky*q.y, zz = kz*q.z;
+    const xy = kx*q.y, xz = kx*q.z, yz = ky*q.z;
+    const sx = kx*q.w, sy = ky*q.w, sz = kz*q.w;
+    return {
+      c0: {x: 1-yy-zz, y: xy-sz, z: xz+sy},
+      c1: {x: xy+sz, y: 1-xx-zz, z: yz-sx},
+      c2: {x: xz-sy, y: yz+sx, z: 1-xx-yy},
+    };
+  },
+  fromAxisAngle: (axis, angle) => {
+    const half = angle * 0.5;
+    const s = Math.sin(half);
+    return {
+      x: axis.x * s, y: axis.y * s, z: axis.z * s,
+      w: Math.cos(half)
+    };
+  }
+};
+
+// ============================================================================
+// Rigid Body Physics Engine (ported from nudge.cpp)
+// ============================================================================
+
+const GRAVITY = -9.82;
+const DAMPING = 0.25;
+const FRICTION = 0.5;
+const ALLOWED_PENETRATION = 1e-3;
+const BIAS_FACTOR = 2.0;
+const MAX_IDLE = 0xFF;
+
+class PhysicsWorld {
+  constructor() {
+    this.bodies = [];        // Body data arrays
+    this.colliders = [];     // Collider data
+    this.contacts = [];      // Contact data
+    this.contactCache = [];  // Warm-start cache: {tag, impulse: [x,y,z]}
+    this.activeBodies = [];  // Indices of active bodies
+    this.sleepingPairs = []; // Pairs that went to sleep
+
+    // Body 0 is the static world body
+    this._addStaticBody();
+  }
+
+  _addStaticBody() {
+    this.bodies.push({
+      position: Vec3.create(),
+      rotation: Quat.identity(),
+      velocity: Vec3.create(),
+      angularVelocity: Vec3.create(),
+      massInverse: 0,
+      inertiaInverse: Vec3.create(0, 0, 0),
+      idleCounter: 0xFF,
+    });
+  }
+
+  addBox(halfExtents, position, rotation, massOverride) {
+    const hx = halfExtents[0], hy = halfExtents[1], hz = halfExtents[2];
+    const volume = 8 * hx * hy * hz; // 8 because halfExtents
+    const mass = massOverride || (hx * hy * hz * 8.0);
+
+    // Inertia for box: I = (m/3) * (h^2 + k^2) for each axis
+    // stored as inverse
+    const k = mass * (1.0/3.0);
+    const inertiaInv = Vec3.create(
+      1.0 / (k*hy*hy + k*hz*hz),
+      1.0 / (k*hx*hx + k*hz*hz),
+      1.0 / (k*hx*hx + k*hy*hy)
+    );
+
+    const bodyIndex = this.bodies.length;
+    this.bodies.push({
+      position: position || Vec3.create(),
+      rotation: rotation || Quat.identity(),
+      velocity: Vec3.create(),
+      angularVelocity: Vec3.create(),
+      massInverse: 1.0 / mass,
+      inertiaInverse: inertiaInv,
+      idleCounter: 0,
+    });
+
+    const colliderIndex = this.colliders.length;
+    this.colliders.push({
+      type: 'box',
+      halfExtents: halfExtents.slice(),
+      body: bodyIndex,
+      localPosition: Vec3.create(),
+      localRotation: Quat.identity(),
+    });
+
+    return bodyIndex;
+  }
+
+  // Add a static collider (attached to body 0, the world body)
+  addStaticBox(halfExtents, position) {
+    const colliderIndex = this.colliders.length;
+    this.colliders.push({
+      type: 'box',
+      halfExtents: halfExtents.slice(),
+      body: 0, // static world body
+      localPosition: position || Vec3.create(),
+      localRotation: Quat.identity(),
+    });
+    return colliderIndex;
+  }
+
+  addStaticSphere(radius, position) {
+    const colliderIndex = this.colliders.length;
+    this.colliders.push({
+      type: 'sphere',
+      radius: radius,
+      body: 0, // static world body
+      localPosition: position || Vec3.create(),
+      localRotation: Quat.identity(),
+    });
+    return colliderIndex;
+  }
+
+  addSphere(radius, position, rotation, massOverride) {
+    const mass = massOverride || (4.18879 * radius * radius * radius);
+    // Sphere inertia: I = (2/5)mr^2, inverse = 5/(2mr^2) = 2.5/(mr^2)
+    const k = 2.5 / (mass * radius * radius);
+
+    const bodyIndex = this.bodies.length;
+    this.bodies.push({
+      position: position || Vec3.create(),
+      rotation: rotation || Quat.identity(),
+      velocity: Vec3.create(),
+      angularVelocity: Vec3.create(),
+      massInverse: 1.0 / mass,
+      inertiaInverse: Vec3.create(k, k, k),
+      idleCounter: 0,
+    });
+
+    const colliderIndex = this.colliders.length;
+    this.colliders.push({
+      type: 'sphere',
+      radius: radius,
+      body: bodyIndex,
+      localPosition: Vec3.create(),
+      localRotation: Quat.identity(),
+    });
+
+    return bodyIndex;
+  }
+
+  // -----------------------------------------------------------------------
+  // Broad phase: simple O(n^2) AABB check (works fine for ~1000 objects)
+  // -----------------------------------------------------------------------
+  computeAABB(collider) {
+    const body = this.bodies[collider.body];
+    const worldPos = Vec3.add(
+      body.position,
+      Quat.rotateVec(body.rotation, collider.localPosition)
+    );
+
+    if (collider.type === 'sphere') {
+      const r = collider.radius;
+      return { min: {x: worldPos.x-r, y: worldPos.y-r, z: worldPos.z-r},
+               max: {x: worldPos.x+r, y: worldPos.y+r, z: worldPos.z+r} };
+    } else {
+      // Box: transform axes by body rotation
+      const mat = Quat.toMatrix3(body.rotation);
+      const hx = collider.halfExtents[0], hy = collider.halfExtents[1], hz = collider.halfExtents[2];
+
+      // AABB size = sum of |axis * extent|
+      const size = {
+        x: Math.abs(mat.c0.x)*hx + Math.abs(mat.c1.x)*hy + Math.abs(mat.c2.x)*hz,
+        y: Math.abs(mat.c0.y)*hx + Math.abs(mat.c1.y)*hy + Math.abs(mat.c2.y)*hz,
+        z: Math.abs(mat.c0.z)*hx + Math.abs(mat.c1.z)*hy + Math.abs(mat.c2.z)*hz,
+      };
+      return { min: {x: worldPos.x-size.x, y: worldPos.y-size.y, z: worldPos.z-size.z},
+               max: {x: worldPos.x+size.x, y: worldPos.y+size.y, z: worldPos.z+size.z} };
+    }
+  }
+
+  aabbsOverlap(a, b) {
+    return a.min.x <= b.max.x && a.max.x >= b.min.x &&
+           a.min.y <= b.max.y && a.max.y >= b.min.y &&
+           a.min.z <= b.max.z && a.max.z >= b.min.z;
+  }
+
+  // -----------------------------------------------------------------------
+  // Collision detection (narrow phase) - ported from nudge.cpp
+  // -----------------------------------------------------------------------
+
+  collide() {
+    this.contacts = [];
+    this.activeBodies = [];
+    this.sleepingPairs = [];
+
+    const n = this.colliders.length;
+    const aabbs = [];
+    for (let i = 0; i < n; i++) {
+      aabbs.push(this.computeAABB(this.colliders[i]));
+    }
+
+    // Broad phase: check all pairs with AABB overlap
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        if (!this.aabbsOverlap(aabbs[i], aabbs[j])) continue;
+
+        const ci = this.colliders[i];
+        const cj = this.colliders[j];
+        const bi = this.bodies[ci.body];
+        const bj = this.bodies[cj.body];
+
+        // Skip if both bodies are the same
+        if (ci.body === cj.body) continue;
+
+        // Skip if both bodies are sleeping
+        if (bi.idleCounter >= MAX_IDLE && bj.idleCounter >= MAX_IDLE) continue;
+
+        let newContacts;
+        if (ci.type === 'sphere' && cj.type === 'sphere') {
+          newContacts = this.sphereSphere(ci, cj);
+        } else if (ci.type === 'box' && cj.type === 'sphere') {
+          newContacts = this.boxSphere(ci, cj);
+        } else if (ci.type === 'sphere' && cj.type === 'box') {
+          newContacts = this.boxSphere(cj, ci);
+        } else {
+          newContacts = this.boxBox(ci, cj);
+        }
+
+        for (const c of newContacts) {
+          // Ensure body order: a < b for caching
+          if (c.bodyA > c.bodyB) {
+            const tmp = c.bodyA; c.bodyA = c.bodyB; c.bodyB = tmp;
+            c.normal = Vec3.negate(c.normal);
+          }
+          this.contacts.push(c);
+        }
+      }
+    }
+
+    // Determine active bodies (body 0 is the static world, never active)
+    const activeSet = new Set();
+    for (let i = 1; i < this.bodies.length; i++) {
+      if (this.bodies[i].idleCounter < MAX_IDLE) {
+        activeSet.add(i);
+      }
+    }
+    for (const c of this.contacts) {
+      if (c.bodyA > 0) activeSet.add(c.bodyA);
+      if (c.bodyB > 0) activeSet.add(c.bodyB);
+    }
+    // Wake up connected bodies (simple island detection)
+    for (const c of this.contacts) {
+      if ((c.bodyA > 0 && activeSet.has(c.bodyA)) || (c.bodyB > 0 && activeSet.has(c.bodyB))) {
+        if (c.bodyA > 0) activeSet.add(c.bodyA);
+        if (c.bodyB > 0) activeSet.add(c.bodyB);
+      }
+    }
+    this.activeBodies = [...activeSet];
+  }
+
+  sphereSphere(a, b) {
+    const aBody = this.bodies[a.body];
+    const bBody = this.bodies[b.body];
+
+    const aPos = Vec3.add(aBody.position, Quat.rotateVec(aBody.rotation, a.localPosition));
+    const bPos = Vec3.add(bBody.position, Quat.rotateVec(bBody.rotation, b.localPosition));
+
+    const dp = Vec3.sub(bPos, aPos);
+    const r = a.radius + b.radius;
+    const l2 = Vec3.lengthSq(dp);
+
+    if (l2 > r * r) return [];
+
+    let n, l = Math.sqrt(l2);
+    if (l2 > 1e-4) {
+      n = Vec3.scale(dp, 1.0 / l);
+    } else {
+      n = {x: 1, y: 0, z: 0};
+    }
+
+    const contactPos = Vec3.add(aPos, Vec3.scale(n, l - b.radius));
+
+    return [{
+      position: contactPos,
+      normal: n,
+      penetration: r - l,
+      friction: FRICTION,
+      bodyA: aBody === this.bodies[0] ? 0 : a.body,
+      bodyB: bBody === this.bodies[0] ? 0 : b.body,
+    }];
+  }
+
+  boxSphere(box, sphere) {
+    const boxBody = this.bodies[box.body];
+    const sphereBody = this.bodies[sphere.body];
+
+    const boxPos = Vec3.add(boxBody.position, Quat.rotateVec(boxBody.rotation, box.localPosition));
+    const spherePos = Vec3.add(sphereBody.position, Quat.rotateVec(sphereBody.rotation, sphere.localPosition));
+
+    // Transform sphere into box local space
+    const invQ = Quat.conjugate(boxBody.rotation);
+    const offset = Vec3.sub(spherePos, boxPos);
+    const localOffset = Quat.rotateVec(invQ, offset);
+
+    const dx = Math.abs(localOffset.x);
+    const dy = Math.abs(localOffset.y);
+    const dz = Math.abs(localOffset.z);
+
+    const hx = box.halfExtents[0], hy = box.halfExtents[1], hz = box.halfExtents[2];
+    const r = sphere.radius;
+
+    const w = hx + r, h = hy + r, d = hz + r;
+    if (dx >= w || dy >= h || dz >= d) return [];
+
+    let n, penetration;
+    const outsideX = dx > hx, outsideY = dy > hy, outsideZ = dz > hz;
+
+    if (outsideX + outsideY + outsideZ >= 2) {
+      // Corner case
+      const corner = {
+        x: outsideX ? (localOffset.x > 0 ? hx : -hx) : localOffset.x,
+        y: outsideY ? (localOffset.y > 0 ? hy : -hy) : localOffset.y,
+        z: outsideZ ? (localOffset.z > 0 ? hz : -hz) : localOffset.z,
+      };
+      const dp = Vec3.sub(localOffset, corner);
+      const l2 = Vec3.lengthSq(dp);
+      if (l2 > r * r) return [];
+      const l = Math.sqrt(l2);
+      const m = 1.0 / Math.max(l, 1e-6);
+      n = Vec3.scale(dp, m);
+      penetration = r - l;
+    } else if (w - dx < h - dy && w - dx < d - dz) {
+      n = {x: localOffset.x > 0 ? 1 : -1, y: 0, z: 0};
+      penetration = w - dx;
+    } else if (h - dy < d - dz) {
+      n = {x: 0, y: localOffset.y > 0 ? 1 : -1, z: 0};
+      penetration = h - dy;
+    } else {
+      n = {x: 0, y: 0, z: localOffset.z > 0 ? 1 : -1};
+      penetration = d - dz;
+    }
+
+    // Transform to world space
+    const worldN = Quat.rotateVec(boxBody.rotation, n);
+    const localP = Vec3.sub(localOffset, Vec3.scale(n, r));
+    const worldP = Vec3.add(boxPos, Quat.rotateVec(boxBody.rotation, localP));
+
+    return [{
+      position: worldP,
+      normal: worldN,
+      penetration,
+      friction: FRICTION,
+      bodyA: box.body,
+      bodyB: sphere.body,
+    }];
+  }
+
+  // boxBox: faithful port of nudge.cpp box_box_collide()
+  // Uses relative rotation matrix, face/edge penetration tests,
+  // and face-face or edge-edge contact computation
+  boxBox(a, b) {
+    const aBody = this.bodies[a.body];
+    const bBody = this.bodies[b.body];
+
+    // World positions of colliders
+    const aPos = Vec3.add(aBody.position, Quat.rotateVec(aBody.rotation, a.localPosition));
+    const bPos = Vec3.add(bBody.position, Quat.rotateVec(bBody.rotation, b.localPosition));
+
+    const aE = a.halfExtents;
+    const bE = b.halfExtents;
+
+    // -------------------------------------------------------------------
+    // Step 1: Relative rotation quaternion (from a's frame to b's frame)
+    // nudge computes: rel = a * conj(b)
+    // Formula: rel_v = a_v * b_s - b_v * a_s - cross(b_v, a_v)
+    //          rel_s = a·b (full quaternion dot product)
+    // -------------------------------------------------------------------
+    const ax = aBody.rotation.x, ay = aBody.rotation.y, az = aBody.rotation.z, as = aBody.rotation.w;
+    const bx = bBody.rotation.x, by = bBody.rotation.y, bz = bBody.rotation.z, bs = bBody.rotation.w;
+
+    const rx = ax*bs - bx*as - (by*az - bz*ay);
+    const ry = ay*bs - by*as - (bz*ax - bx*az);
+    const rz = az*bs - bz*as - (bx*ay - by*ax);
+    const rs = ax*bx + ay*by + az*bz + as*bs;
+
+    // -------------------------------------------------------------------
+    // Step 2: Build 3x3 rotation matrix R = aToB from relative quaternion
+    // R transforms vectors from a's local frame to b's local frame.
+    // R[row][col] layout:
+    //   Column j = a's j-th axis expressed in b's frame
+    //   Row i    = b's i-th axis expressed in a's frame (R^T = bToA)
+    // -------------------------------------------------------------------
+    const kx = rx+rx, ky = ry+ry, kz = rz+rz;
+    const xx = kx*rx, yy = ky*ry, zz = kz*rz;
+    const xy = kx*ry, xz = kx*rz, yz = ky*rz;
+    const sx = kx*rs, sy = ky*rs, sz = kz*rs;
+
+    const vx_x = 1-yy-zz, vx_y = xy+sz, vx_z = xz-sy;
+    const vy_x = xy-sz, vy_y = 1-xx-zz, vy_z = yz+sx;
+    const vz_x = xz+sy, vz_y = yz-sx, vz_z = 1-xx-yy;
+
+    // aAxis[j] = column j = a's j-th axis in b's frame
+    const aAxis = [
+      {x: vx_x, y: vx_y, z: vx_z},
+      {x: vy_x, y: vy_y, z: vy_z},
+      {x: vz_x, y: vz_y, z: vz_z},
+    ];
+    // bAxis[i] = row i = b's i-th axis in a's frame
+    const bAxis = [
+      {x: vx_x, y: vy_x, z: vz_x},
+      {x: vx_y, y: vy_y, z: vz_y},
+      {x: vx_z, y: vy_z, z: vz_z},
+    ];
+
+    // -------------------------------------------------------------------
+    // Step 3: Position offsets in each other's frames
+    // aOffset = delta in b's frame (nudge formula: quat_rotate(conj(b), delta))
+    // bOffset = direction from a center to b center, in a's frame
+    // -------------------------------------------------------------------
+    const delta = Vec3.sub(aPos, bPos);
+
+    // aOffset = delta in b's frame
+    const at_x = by*delta.z - bz*delta.y;
+    const at_y = bz*delta.x - bx*delta.z;
+    const at_z = bx*delta.y - by*delta.x;
+    const at2_x = at_x*2, at2_y = at_y*2, at2_z = at_z*2;
+    const au_x = by*at2_z - bz*at2_y;
+    const au_y = bz*at2_x - bx*at2_z;
+    const au_z = bx*at2_y - by*at2_x;
+    const aOffset = {x: au_x + delta.x - bs*at2_x, y: au_y + delta.y - bs*at2_y, z: au_z + delta.z - bs*at2_z};
+
+    // bOffset = direction from a center to b center, in a's frame
+    const bt_x = delta.y*az - delta.z*ay;
+    const bt_y = delta.z*ax - delta.x*az;
+    const bt_z = delta.x*ay - delta.y*ax;
+    const bt2_x = bt_x*2, bt2_y = bt_y*2, bt2_z = bt_z*2;
+    const bu_x = ay*bt2_z - az*bt2_y;
+    const bu_y = az*bt2_x - ax*bt2_z;
+    const bu_z = ax*bt2_y - ay*bt2_x;
+    const bOffset = {x: bu_x - delta.x - as*bt2_x, y: bu_y - delta.y - as*bt2_y, z: bu_z - delta.z - as*bt2_z};
+
+    // -------------------------------------------------------------------
+    // Step 4: Face penetration test (nudge's face test)
+    // pax/pay/paz: b's face penetrations (in b's frame)
+    // pbx/pby/pbz: a's face penetrations (in a's frame)
+    // -------------------------------------------------------------------
+    const absVx_x = Math.abs(vx_x), absVx_y = Math.abs(vx_y), absVx_z = Math.abs(vx_z);
+    const absVy_x = Math.abs(vy_x), absVy_y = Math.abs(vy_y), absVy_z = Math.abs(vy_z);
+    const absVz_x = Math.abs(vz_x), absVz_y = Math.abs(vz_y), absVz_z = Math.abs(vz_z);
+
+    // b's face penetrations
+    const pax = bE[0] + absVx_x*aE[0] + absVy_x*aE[1] + absVz_x*aE[2] - Math.abs(aOffset.x);
+    const pay = bE[1] + absVx_y*aE[0] + absVy_y*aE[1] + absVz_y*aE[2] - Math.abs(aOffset.y);
+    const paz = bE[2] + absVx_z*aE[0] + absVy_z*aE[1] + absVz_z*aE[2] - Math.abs(aOffset.z);
+
+    // a's face penetrations
+    const pbx = aE[0] + absVx_x*bE[0] + absVx_y*bE[1] + absVx_z*bE[2] - Math.abs(bOffset.x);
+    const pby = aE[1] + absVy_x*bE[0] + absVy_y*bE[1] + absVy_z*bE[2] - Math.abs(bOffset.y);
+    const pbz = aE[2] + absVz_x*bE[0] + absVz_y*bE[1] + absVz_z*bE[2] - Math.abs(bOffset.z);
+
+    const paMin = Math.min(pax, Math.min(pay, paz));
+    const pbMin = Math.min(pbx, Math.min(pby, pbz));
+    const facePen = Math.min(paMin, pbMin);
+
+    if (facePen < 0) return []; // Separated by a face
+
+    // -------------------------------------------------------------------
+    // Step 5: Edge penetration test
+    // For each a_edge_i: ac = b's i-th axis in a's frame (row i), bc = a's i-th axis in b's frame (col i)
+    // -------------------------------------------------------------------
+    const edgePenA = new Float64Array(9);
+    const edgePenB = new Float64Array(9);
+
+    for (let i = 0; i < 3; i++) {
+      const acx = bAxis[i].x, acy = bAxis[i].y, acz = bAxis[i].z;
+      const bcx = aAxis[i].x, bcy = aAxis[i].y, bcz = aAxis[i].z;
+
+      const ac2x = acx*acx, ac2y = acy*acy, ac2z = acz*acz;
+      const bc2x = bcx*bcx, bc2y = bcy*bcy, bc2z = bcz*bcz;
+
+      const aacx = Math.abs(acx), aacy = Math.abs(acy), aacz = Math.abs(acz);
+      const abcx = Math.abs(bcx), abcy = Math.abs(bcy), abcz = Math.abs(bcz);
+
+      const r_a0_sq = ac2y + ac2z;
+      const r_a1_sq = ac2z + ac2x;
+      const r_a2_sq = ac2x + ac2y;
+      const r_b0_sq = bc2y + bc2z;
+      const r_b1_sq = bc2z + bc2x;
+      const r_b2_sq = bc2x + bc2y;
+
+      const r_a0 = r_a0_sq > 1e-6 ? 1.0 / Math.sqrt(r_a0_sq) : 1e10;
+      const r_a1 = r_a1_sq > 1e-6 ? 1.0 / Math.sqrt(r_a1_sq) : 1e10;
+      const r_a2 = r_a2_sq > 1e-6 ? 1.0 / Math.sqrt(r_a2_sq) : 1e10;
+      const r_b0 = r_b0_sq > 1e-6 ? 1.0 / Math.sqrt(r_b0_sq) : 1e10;
+      const r_b1 = r_b1_sq > 1e-6 ? 1.0 / Math.sqrt(r_b1_sq) : 1e10;
+      const r_b2 = r_b2_sq > 1e-6 ? 1.0 / Math.sqrt(r_b2_sq) : 1e10;
+
+      const pa0 = aacy*aE[2] + aacz*aE[1];
+      const pa1 = aacz*aE[0] + aacx*aE[2];
+      const pa2 = aacx*aE[1] + aacy*aE[0];
+      const pb0 = abcy*bE[2] + abcz*bE[1];
+      const pb1 = abcz*bE[0] + abcx*bE[2];
+      const pb2 = abcx*bE[1] + abcy*bE[0];
+
+      const o0 = Math.abs(acy*bOffset.z - acz*bOffset.y);
+      const o1 = Math.abs(acz*bOffset.x - acx*bOffset.z);
+      const o2 = Math.abs(acx*bOffset.y - acy*bOffset.x);
+
+      edgePenA[i*3 + 0] = (pa0 - o0) * r_a0;
+      edgePenA[i*3 + 1] = (pa1 - o1) * r_a1;
+      edgePenA[i*3 + 2] = (pa2 - o2) * r_a2;
+      edgePenB[i*3 + 0] = pb0 * r_b0;
+      edgePenB[i*3 + 1] = pb1 * r_b1;
+      edgePenB[i*3 + 2] = pb2 * r_b2;
+    }
+
+    let bestPen = facePen;
+    let bestEdgeA = 0, bestEdgeB = 0;
+
+    for (let i = 0; i < 3; i++) {
+      for (let j = 0; j < 3; j++) {
+        const p = edgePenA[i*3+j] + edgePenB[j*3+i];
+        if (p < bestPen) {
+          bestPen = p;
+          bestEdgeA = j;
+          bestEdgeB = i;
+        }
+      }
+    }
+
+    const faceBias = 1e-3;
+    const isEdge = facePen > bestPen + faceBias;
+
+    // -------------------------------------------------------------------
+    // Step 6: Compute contact normal and position
+    // -------------------------------------------------------------------
+    if (isEdge) {
+      const aEdgeDir = Quat.rotateVec(aBody.rotation, this._unitAxis(bestEdgeB));
+      const bEdgeDir = Quat.rotateVec(bBody.rotation, this._unitAxis(bestEdgeA));
+      const result = this._closestPointsOnEdges(aPos, aEdgeDir, aE, bPos, bEdgeDir, bE, bestEdgeB, bestEdgeA);
+      if (result) {
+        let worldN = Vec3.normalize(result.direction);
+        // Solver convention: n points from bodyA to bodyB
+        const dirAB = Vec3.sub(bPos, aPos);
+        if (Vec3.dot(worldN, dirAB) < 0) {
+          worldN = {x:-worldN.x, y:-worldN.y, z:-worldN.z};
+        }
+        return [{
+          position: result.midpoint,
+          normal: worldN,
+          penetration: result.distance,
+          friction: FRICTION,
+          bodyA: a.body,
+          bodyB: b.body,
+        }];
+      }
+    } else {
+      // Face-face contact: generate up to 4 contact points.
+      //
+      // Strategy: work in the MSF box's local frame, test that box's own
+      // vertices against the OTHER box's face.  This handles the common
+      // "small box on large ground" case correctly — the small box's bottom
+      // vertices easily land inside the ground's large face.
+      //
+      // R transforms from A's frame → B's frame.
+      //   aAxis[j] = column j = A's j-th axis in B's frame
+      //   bAxis[i] = row    i = B's i-th axis in A's frame
+
+      // const aHasMSF = pbMin <= paMin;
+
+      // // Face axis index (axis of the MSF)
+      // const fi = aHasMSF
+      //   ? ((pbx <= pby && pbx <= pbz) ? 0 : (pby <= pbz ? 1 : 2))
+      //   : ((pax <= pay && pax <= paz) ? 0 : (pay <= paz ? 1 : 2));
+
+      // // Reference frame = MSF box's local frame.
+      // // When aHasMSF: ref = A,   working frame = B, test B's vertices vs A's face
+      // // When !aHasMSF: ref = B,   working frame = A, test A's vertices vs B's face
+      // const refBody = aHasMSF ? aBody : bBody;
+      // const refE    = aHasMSF ? aE    : bE;
+
+      // // Face normal direction: outward from ref face toward the other box.
+      // // offsetVec = other-box center in ref-frame.
+      // const offsetVec = aHasMSF ? bOffset : aOffset;
+      // const compKey = fi === 0 ? 'x' : (fi === 1 ? 'y' : 'z');
+      // const sign = offsetVec[compKey] > 0 ? 1 : -1;
+
+      // const nRef = this._unitAxis(fi);
+      // if (fi === 0) nRef.x *= sign;
+      // else if (fi === 1) nRef.y *= sign;
+      // else nRef.z *= sign;
+
+      // // World-space normal, verified to point bodyA → bodyB
+      // let worldN = Quat.rotateVec(refBody.rotation, nRef);
+      // const dirAB = Vec3.sub(bPos, aPos);
+      // if (Vec3.dot(worldN, dirAB) < 0) worldN = Vec3.negate(worldN);
+
+      // // Tangent axes: the two ref-frame axes perpendicular to fi,
+      // // expressed in the *working* frame (where the test vertices live).
+      // const t1Idx = (fi + 1) % 3, t2Idx = (fi + 2) % 3;
+      // const t1Other = aHasMSF ? aAxis[t1Idx] : bAxis[t1Idx];
+      // const t2Other = aHasMSF ? aAxis[t2Idx] : bAxis[t2Idx];
+
+      // // Face position in the working frame = ref-box center in working frame
+      // //                                      + nRef * (refE[fi] * sign)
+      // // aOffset = A's center in B's frame;  bOffset = B's center in A's frame.
+      // const refCenterWork = aHasMSF ? aOffset : bOffset;
+      // const faceDist = refE[fi] * sign;
+      // const facePosWork = {
+      //   x: refCenterWork.x + nRef.x * faceDist,
+      //   y: refCenterWork.y + nRef.y * faceDist,
+      //   z: refCenterWork.z + nRef.z * faceDist,
+      // };
+
+      // // Vertices of the MSF box (in its own = ref frame) & world transform info
+      // const testE   = refE;
+      // const testPos = aHasMSF ? bPos : aPos;
+
+      // const contacts = [];
+
+      // // --- Test all 8 vertices of the MSF box ---
+      // for (let mask = 0; mask < 8; mask++) {
+      //   const vRef = {
+      //     x: ((mask & 1) ? 1 : -1) * testE[0],
+      //     y: ((mask & 2) ? 1 : -1) * testE[1],
+      //     z: ((mask & 4) ? 1 : -1) * testE[2],
+      //   };
+
+      //   // Penetration into the other-box face (expressed in ref frame,
+      //   // but nRef is axis-aligned in ref frame so the dot product is trivial)
+      //   const pen = (vRef.x - facePosWork.x) * nRef.x
+      //             + (vRef.y - facePosWork.y) * nRef.y
+      //             + (vRef.z - facePosWork.z) * nRef.z;
+      //   if (pen <= 0) continue;
+
+      //   // Contact = vertex projected onto the face, in ref frame
+      //   const cRef = {
+      //     x: vRef.x - nRef.x * pen,
+      //     y: vRef.y - nRef.y * pen,
+      //     z: vRef.z - nRef.z * pen,
+      //   };
+
+      //   // Check if contact lands inside the ref face.
+      //   // Project cRef onto tangents (which are in the working frame,
+      //   // but cRef is in ref frame — we need to express cRef in the working
+      //   // frame, or the tangents in the ref frame).
+      //   //
+      //   // Simpler: project in the ref frame using ref-frame tangents
+      //   // (the other two axes, which are just unit vectors in ref frame).
+      //   const t1Ref = this._unitAxis(t1Idx);
+      //   const t2Ref = this._unitAxis(t2Idx);
+      //   const p1 = cRef.x * t1Ref.x + cRef.y * t1Ref.y + cRef.z * t1Ref.z;
+      //   const p2 = cRef.x * t2Ref.x + cRef.y * t2Ref.y + cRef.z * t2Ref.z;
+      //   if (Math.abs(p1) > refE[t1Idx] + 1e-4) continue;
+      //   if (Math.abs(p2) > refE[t2Idx] + 1e-4) continue;
+
+      //   // Transform contact to world space
+      //   const worldPos = Vec3.add(
+      //     testPos,
+      //     Quat.rotateVec(refBody.rotation, cRef)
+      //   );
+
+      //   contacts.push({
+      //     position: worldPos,
+      //     normal: worldN,
+      //     penetration: pen,
+      //     friction: FRICTION,
+      //     bodyA: a.body,
+      //     bodyB: b.body,
+      //   });
+      // }
+
+      // // Fallback: single contact at face center
+      // if (contacts.length === 0) {
+      //   const faceWorld = Vec3.add(
+      //     (aHasMSF ? aPos : bPos),
+      //     Vec3.scale(worldN, faceDist)
+      //   );
+      //   return [{
+      //     position: faceWorld,
+      //     normal: worldN,
+      //     penetration: facePen,
+      //     friction: FRICTION,
+      //     bodyA: a.body,
+      //     bodyB: b.body,
+      //   }];
+      // }
+
+      // return contacts;
+
+
+      // ================================================================
+      // FACE-FACE MANIFOLD GENERATION (Box2D/Bullet style clipping)
+      // ================================================================
+
+      const aHasMSF = pbMin <= paMin;
+
+      const refBody   = aHasMSF ? aBody : bBody;
+      const incBody   = aHasMSF ? bBody : aBody;
+
+      const refBox    = aHasMSF ? a : b;
+      const incBox    = aHasMSF ? b : a;
+
+      const refE      = aHasMSF ? aE : bE;
+      const incE      = aHasMSF ? bE : aE;
+
+      const refPos    = aHasMSF ? aPos : bPos;
+      const incPos    = aHasMSF ? bPos : aPos;
+
+      // ------------------------------------------------
+      // Reference face axis
+      // ------------------------------------------------
+
+      const fi = aHasMSF
+        ? ((pbx <= pby && pbx <= pbz) ? 0 : (pby <= pbz ? 1 : 2))
+        : ((pax <= pay && pax <= paz) ? 0 : (pay <= paz ? 1 : 2));
+
+      const refAxes = [
+        Quat.rotateVec(refBody.rotation, {x:1,y:0,z:0}),
+        Quat.rotateVec(refBody.rotation, {x:0,y:1,z:0}),
+        Quat.rotateVec(refBody.rotation, {x:0,y:0,z:1}),
+      ];
+
+      const incAxes = [
+        Quat.rotateVec(incBody.rotation, {x:1,y:0,z:0}),
+        Quat.rotateVec(incBody.rotation, {x:0,y:1,z:0}),
+        Quat.rotateVec(incBody.rotation, {x:0,y:0,z:1}),
+      ];
+
+      // ------------------------------------------------
+      // Reference normal
+      // ------------------------------------------------
+
+      let normal = Vec3.copy(refAxes[fi]);
+
+      const centerDelta = Vec3.sub(incPos, refPos);
+
+      if (Vec3.dot(centerDelta, normal) < 0) {
+        normal = Vec3.negate(normal);
+      }
+
+      // Ensure normal points A -> B
+      const dirAB = Vec3.sub(bPos, aPos);
+      if (Vec3.dot(normal, dirAB) < 0) {
+        normal = Vec3.negate(normal);
+      }
+
+      // ------------------------------------------------
+      // Find incident face
+      // Most anti-parallel face to reference normal
+      // ------------------------------------------------
+
+      let incidentAxis = 0;
+      let minDot = Infinity;
+
+      for (let i = 0; i < 3; i++) {
+        const d = Vec3.dot(normal, incAxes[i]);
+
+        if (d < minDot) {
+          minDot = d;
+          incidentAxis = i;
+        }
+      }
+
+      const incidentNormal = incAxes[incidentAxis];
+
+      const incidentSign =
+        Vec3.dot(incidentNormal, normal) > 0 ? -1 : 1;
+
+      // ------------------------------------------------
+      // Build incident face quad
+      // ------------------------------------------------
+
+      const ia = incidentAxis;
+      const iu = (ia + 1) % 3;
+      const iv = (ia + 2) % 3;
+
+      const incidentCenter = Vec3.add(
+        incPos,
+        Vec3.scale(incAxes[ia], incE[ia] * incidentSign)
+      );
+
+      const iuAxis = incAxes[iu];
+      const ivAxis = incAxes[iv];
+
+      let poly = [];
+
+      for (let su of [-1, 1]) {
+        for (let sv of [-1, 1]) {
+          poly.push(
+            Vec3.add(
+              Vec3.add(
+                incidentCenter,
+                Vec3.scale(iuAxis, su * incE[iu])
+              ),
+              Vec3.scale(ivAxis, sv * incE[iv])
+            )
+          );
+        }
+      }
+
+      // ------------------------------------------------
+      // Reference face side planes
+      // ------------------------------------------------
+
+      const ru = (fi + 1) % 3;
+      const rv = (fi + 2) % 3;
+
+      const refCenter = Vec3.add(
+        refPos,
+        Vec3.scale(normal, refE[fi])
+      );
+
+      const sideU = refAxes[ru];
+      const sideV = refAxes[rv];
+
+      // ------------------------------------------------
+      // Polygon clipping helper
+      // ------------------------------------------------
+
+      function clipPoly(poly, planeN, planeD) {
+        const out = [];
+
+        for (let i = 0; i < poly.length; i++) {
+          const a = poly[i];
+          const b = poly[(i + 1) % poly.length];
+
+          const da = Vec3.dot(planeN, a) - planeD;
+          const db = Vec3.dot(planeN, b) - planeD;
+
+          const ina = da <= 0;
+          const inb = db <= 0;
+
+          if (ina && inb) {
+            out.push(b);
+          }
+          else if (ina && !inb) {
+            const t = da / (da - db);
+
+            out.push({
+              x: a.x + (b.x - a.x) * t,
+              y: a.y + (b.y - a.y) * t,
+              z: a.z + (b.z - a.z) * t,
+            });
+          }
+          else if (!ina && inb) {
+            const t = da / (da - db);
+
+            out.push({
+              x: a.x + (b.x - a.x) * t,
+              y: a.y + (b.y - a.y) * t,
+              z: a.z + (b.z - a.z) * t,
+            });
+
+            out.push(b);
+          }
+        }
+
+        return out;
+      }
+
+      // ------------------------------------------------
+      // Clip against 4 side planes
+      // ------------------------------------------------
+
+      const extentU = refE[ru];
+      const extentV = refE[rv];
+
+      poly = clipPoly(
+        poly,
+        sideU,
+        Vec3.dot(sideU, refCenter) + extentU
+      );
+
+      poly = clipPoly(
+        poly,
+        Vec3.negate(sideU),
+        -Vec3.dot(sideU, refCenter) + extentU
+      );
+
+      poly = clipPoly(
+        poly,
+        sideV,
+        Vec3.dot(sideV, refCenter) + extentV
+      );
+
+      poly = clipPoly(
+        poly,
+        Vec3.negate(sideV),
+        -Vec3.dot(sideV, refCenter) + extentV
+      );
+
+      if (poly.length === 0) return [];
+
+      // ------------------------------------------------
+      // Final contacts
+      // ------------------------------------------------
+
+      const contacts = [];
+
+      const refPlaneD = Vec3.dot(normal, refCenter);
+
+      for (const p of poly) {
+        const depth = refPlaneD - Vec3.dot(normal, p);
+
+        if (depth >= -1e-4) {
+          contacts.push({
+            position: Vec3.sub(
+              p,
+              Vec3.scale(normal, depth * 0.5)
+            ),
+            normal,
+            penetration: Math.max(depth, 0),
+            friction: FRICTION,
+            bodyA: a.body,
+            bodyB: b.body,
+          });
+        }
+      }
+
+      // Reduce manifold to max 4 contacts
+      if (contacts.length > 4) {
+        contacts.length = 4;
+      }
+
+      return contacts;
+
+    }
+
+    return [];
+  }
+
+  _unitAxis(idx) {
+    if (idx === 0) return {x:1,y:0,z:0};
+    if (idx === 1) return {x:0,y:1,z:0};
+    return {x:0,y:0,z:1};
+  }
+
+  _closestPointsOnEdges(aPos, aEdgeDir, aE, bPos, bEdgeDir, bE, aAxisIdx, bAxisIdx) {
+    // Edge half-length = the box's half-extent along the edge axis direction
+    const aHalfLen = aE[aAxisIdx];
+    const bHalfLen = bE[bAxisIdx];
+
+    const dirDot = Vec3.dot(aEdgeDir, bEdgeDir);
+    const w0 = Vec3.sub(aPos, bPos);
+    const w0DotA = Vec3.dot(w0, aEdgeDir);
+    const w0DotB = Vec3.dot(w0, bEdgeDir);
+
+    const denom = 1 - dirDot * dirDot;
+    let s, t;
+
+    if (denom < 1e-8) {
+      s = 0;
+      t = w0DotB;
+    } else {
+      s = (dirDot * w0DotB - w0DotA) / denom;
+      t = (w0DotA - dirDot * w0DotB) / denom;
+    }
+
+    s = Math.max(-aHalfLen, Math.min(aHalfLen, s));
+    t = Math.max(-bHalfLen, Math.min(bHalfLen, t));
+
+    const pA = Vec3.add(aPos, Vec3.scale(aEdgeDir, s));
+    const pB = Vec3.add(bPos, Vec3.scale(bEdgeDir, t));
+    const direction = Vec3.sub(pB, pA);
+    const distance = Vec3.length(direction);
+
+    if (distance < 1e-8) {
+      return {midpoint: pA, direction: Vec3.create(0,1,0), distance: 0.001};
+    }
+
+    return {
+      midpoint: Vec3.scale(Vec3.add(pA, pB), 0.5),
+      direction: direction,
+      distance: distance,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Constraint solver - Sequential impulse method from nudge.cpp
+  // Uses warm-starting, position correction bias, and Coulomb friction cone
+  // -----------------------------------------------------------------------
+
+  solve() {
+    const contacts = this.contacts;
+    if (contacts.length === 0) return;
+
+    // Per-contact state: accumulated normal + friction impulses
+    const state = [];
+    for (let i = 0; i < contacts.length; i++) {
+      const c = contacts[i];
+      const tag = (c.bodyA << 16) | (c.bodyB & 0xFFFF);
+
+      // Look up cached impulse from previous frame (warm start)
+      let cached = {x: 0, y: 0, z: 0};
+      for (const entry of this.contactCache) {
+        if (entry.tag === tag) { cached = entry.impulse; break; }
+      }
+
+      // Pre-compute constraint data (mirrors nudge setup_contact_constraints)
+      const bodyA = this.bodies[c.bodyA];
+      const bodyB = this.bodies[c.bodyB];
+      const pa = Vec3.sub(c.position, bodyA.position);
+      const pb = Vec3.sub(c.position, bodyB.position);
+
+      // Smoothly-varying tangent basis (from nudge)
+      const n = c.normal;
+      const s = Math.abs(n.x);
+      const u = Vec3.normalize(Vec3.create(
+        n.z * s,
+        -n.z + n.z * s,
+        n.y + (n.x - n.y) * s
+      ));
+      const v = Vec3.normalize(Vec3.cross(u, n));
+
+      // Relative position cross products for effective mass
+      const rA_n = Vec3.cross(pa, n);
+      const rA_u = Vec3.cross(pa, u);
+      const rA_v = Vec3.cross(pa, v);
+      const rB_n = Vec3.cross(pb, n);
+      const rB_u = Vec3.cross(pb, u);
+      const rB_v = Vec3.cross(pb, v);
+
+      // Inverse inertia applied to cross products (in world frame approximation)
+      const riA_n = Vec3.create(rA_n.x*bodyA.inertiaInverse.x, rA_n.y*bodyA.inertiaInverse.y, rA_n.z*bodyA.inertiaInverse.z);
+      const riA_u = Vec3.create(rA_u.x*bodyA.inertiaInverse.x, rA_u.y*bodyA.inertiaInverse.y, rA_u.z*bodyA.inertiaInverse.z);
+      const riA_v = Vec3.create(rA_v.x*bodyA.inertiaInverse.x, rA_v.y*bodyA.inertiaInverse.y, rA_v.z*bodyA.inertiaInverse.z);
+      const riB_n = Vec3.create(rB_n.x*bodyB.inertiaInverse.x, rB_n.y*bodyB.inertiaInverse.y, rB_n.z*bodyB.inertiaInverse.z);
+      const riB_u = Vec3.create(rB_u.x*bodyB.inertiaInverse.x, rB_u.y*bodyB.inertiaInverse.y, rB_u.z*bodyB.inertiaInverse.z);
+      const riB_v = Vec3.create(rB_v.x*bodyB.inertiaInverse.x, rB_v.y*bodyB.inertiaInverse.y, rB_v.z*bodyB.inertiaInverse.z);
+
+      // Normal velocity to normal impulse factor: 1/(invMass + r·I⁻¹·r) for normal
+      const invMass = bodyA.massInverse + bodyB.massInverse;
+      const rInA = Vec3.dot(riA_n, rA_n); // rA × n · I⁻¹ · (rA × n)
+      const rInB = Vec3.dot(riB_n, rB_n);
+      const normalVelToNormalImpulse = -(invMass + rInA + rInB);
+
+      // Friction coefficients for solving 2x2 friction system
+      const rIuA = Vec3.dot(riA_u, rA_u);
+      const rIvA = Vec3.dot(riA_v, rA_v);
+      const rIuvA = Vec3.dot(riA_u, rA_v) + Vec3.dot(riA_v, rA_u);
+      const rIuB = Vec3.dot(riB_u, rB_u);
+      const rIvB = Vec3.dot(riB_v, rB_v);
+      const rIuvB = Vec3.dot(riB_u, rB_v) + Vec3.dot(riB_v, rB_u);
+
+      const fricX = invMass + rIuA + rIuB;
+      const fricY = invMass + rIvA + rIvB;
+      const fricZ = rIuvA + rIuvB;
+
+      // Position correction bias
+      const bias = c.penetration > ALLOWED_PENETRATION
+        ? -BIAS_FACTOR * (c.penetration - ALLOWED_PENETRATION) * normalVelToNormalImpulse
+        : 0;
+
+      // Decompose cached impulse into normal + friction components
+      const cachedN = Math.max(Vec3.dot(cached, n), 0);
+      let cachedFu = Vec3.dot(cached, u);
+      let cachedFv = Vec3.dot(cached, v);
+
+      // Clamp cached friction to cone
+      const cachedFricLen = Math.sqrt(cachedFu*cachedFu + cachedFv*cachedFv);
+      const maxFric = cachedN * c.friction;
+      if (cachedFricLen > maxFric && cachedFricLen > 1e-6) {
+        cachedFu *= maxFric / cachedFricLen;
+        cachedFv *= maxFric / cachedFricLen;
+      }
+
+      // Apply warm start impulse to bodies
+      const warmImpulse = Vec3.add(
+        Vec3.add(Vec3.scale(n, cachedN), Vec3.scale(u, cachedFu)),
+        Vec3.scale(v, cachedFv)
+      );
+      this._applyImpulseToBodies(c, warmImpulse);
+
+      state.push({
+        bodyA, bodyB, pa, pb, n, u, v, c,
+        normalVelToNormalImpulse, fricX, fricY, fricZ,
+        bias, friction: c.friction,
+        appliedN: cachedN,
+        appliedFu: cachedFu,
+        appliedFv: cachedFv,
+      });
+    }
+
+    // Iterative impulse solving (20 iterations like nudge)
+    for (let iter = 0; iter < 20; iter++) {
+      for (let i = 0; i < state.length; i++) {
+        const s = state[i];
+        const {bodyA, bodyB, pa, pb, n, u, v, c, normalVelToNormalImpulse, fricX, fricY, fricZ, bias, friction} = s;
+
+        // Contact point velocities
+        const va = Vec3.add(bodyA.velocity, Vec3.cross(bodyA.angularVelocity, pa));
+        const vb = Vec3.add(bodyB.velocity, Vec3.cross(bodyB.angularVelocity, pb));
+        const vRel = Vec3.sub(vb, va);
+
+        // Relative velocity in normal/tangent directions
+        const vn = Vec3.dot(vRel, n);
+        const vu = Vec3.dot(vRel, u);
+        const vv = Vec3.dot(vRel, v);
+
+        // ---- Normal impulse ----
+        const oldN = s.appliedN;
+        const jnDelta = vn * normalVelToNormalImpulse + bias + oldN;
+        const newN = Math.max(jnDelta, 0);
+        const deltaN = newN - oldN;
+
+        // ---- Friction impulse (2x2 system) ----
+        const oldFu = s.appliedFu;
+        const oldFv = s.appliedFv;
+
+        // Solve for friction impulse
+        const det = fricX * fricY - fricZ * fricZ;
+        const invDet = Math.abs(det) > 1e-10 ? 1.0 / det : 0;
+
+        const fuDelta = vu * (fricY * invDet) + vv * (fricZ * invDet);
+        const fvDelta = vu * (fricZ * invDet) + vv * (fricX * invDet);
+
+        let newFu = oldFu - fuDelta;
+        let newFv = oldFv - fvDelta;
+
+        // Clamp friction to Coulomb cone
+        const maxFric = newN * friction;
+        const fricLen = Math.sqrt(newFu*newFu + newFv*newFv);
+        if (fricLen > maxFric && fricLen > 1e-6) {
+          const scale = maxFric / fricLen;
+          newFu *= scale;
+          newFv *= scale;
+        }
+
+        const deltaFu = newFu - oldFu;
+        const deltaFv = newFv - oldFv;
+
+        // ---- Apply impulse delta to bodies ----
+        const impulseDelta = Vec3.add(
+          Vec3.add(Vec3.scale(n, deltaN), Vec3.scale(u, deltaFu)),
+          Vec3.scale(v, deltaFv)
+        );
+
+        // Body A gets -impulseDelta
+        const negImp = Vec3.negate(impulseDelta);
+        bodyA.velocity = Vec3.add(bodyA.velocity, Vec3.scale(negImp, bodyA.massInverse));
+        const torA = Vec3.cross(pa, negImp);
+        bodyA.angularVelocity = Vec3.add(bodyA.angularVelocity,
+          Vec3.create(torA.x*bodyA.inertiaInverse.x, torA.y*bodyA.inertiaInverse.y, torA.z*bodyA.inertiaInverse.z));
+
+        // Body B gets +impulseDelta
+        bodyB.velocity = Vec3.add(bodyB.velocity, Vec3.scale(impulseDelta, bodyB.massInverse));
+        const torB = Vec3.cross(pb, impulseDelta);
+        bodyB.angularVelocity = Vec3.add(bodyB.angularVelocity,
+          Vec3.create(torB.x*bodyB.inertiaInverse.x, torB.y*bodyB.inertiaInverse.y, torB.z*bodyB.inertiaInverse.z));
+
+        // Store accumulated impulses
+        s.appliedN = newN;
+        s.appliedFu = newFu;
+        s.appliedFv = newFv;
+      }
+    }
+
+    // Write back to contact cache (for next frame warm-start)
+    this.contactCache = [];
+    for (let i = 0; i < state.length; i++) {
+      const s = state[i];
+      const totalImpulse = Vec3.add(
+        Vec3.add(Vec3.scale(s.n, s.appliedN), Vec3.scale(s.u, s.appliedFu)),
+        Vec3.scale(s.v, s.appliedFv)
+      );
+      const tag = (s.c.bodyA << 16) | (s.c.bodyB & 0xFFFF);
+      this.contactCache.push({tag, impulse: Vec3.copy(totalImpulse)});
+    }
+  }
+
+  _applyImpulseToBodies(contact, impulse) {
+    const bodyA = this.bodies[contact.bodyA];
+    const bodyB = this.bodies[contact.bodyB];
+    const pa = Vec3.sub(contact.position, bodyA.position);
+    const pb = Vec3.sub(contact.position, bodyB.position);
+
+    // Body A: subtract impulse (normal points A->B)
+    bodyA.velocity = Vec3.sub(bodyA.velocity, Vec3.scale(impulse, bodyA.massInverse));
+    const torA = Vec3.cross(pa, Vec3.negate(impulse));
+    bodyA.angularVelocity = Vec3.add(bodyA.angularVelocity,
+      Vec3.create(torA.x*bodyA.inertiaInverse.x, torA.y*bodyA.inertiaInverse.y, torA.z*bodyA.inertiaInverse.z));
+
+    // Body B: add impulse
+    bodyB.velocity = Vec3.add(bodyB.velocity, Vec3.scale(impulse, bodyB.massInverse));
+    const torB = Vec3.cross(pb, impulse);
+    bodyB.angularVelocity = Vec3.add(bodyB.angularVelocity,
+      Vec3.create(torB.x*bodyB.inertiaInverse.x, torB.y*bodyB.inertiaInverse.y, torB.z*bodyB.inertiaInverse.z));
+  }
+
+  // -----------------------------------------------------------------------
+  // Integration step - ported from nudge.cpp advance()
+  // -----------------------------------------------------------------------
+
+  advance(dt) {
+    const halfDt = dt * 0.5;
+
+    for (const idx of this.activeBodies) {
+      const body = this.bodies[idx];
+
+      // Damping (gravity already applied in simulate() before solve)
+      const damping = 1.0 - dt * DAMPING;
+      body.velocity.x *= damping;
+      body.velocity.y *= damping;
+      body.velocity.z *= damping;
+      body.angularVelocity.x *= damping;
+      body.angularVelocity.y *= damping;
+      body.angularVelocity.z *= damping;
+
+      // Update idle counter
+      const velSq = Vec3.lengthSq(body.velocity);
+      const angVelSq = Vec3.lengthSq(body.angularVelocity);
+      if (velSq < 1e-2 && angVelSq < 1e-1) {
+        if (body.idleCounter < MAX_IDLE) body.idleCounter++;
+      } else {
+        body.idleCounter = 0;
+      }
+
+      // Position integration
+      body.position.x += body.velocity.x * dt;
+      body.position.y += body.velocity.y * dt;
+      body.position.z += body.velocity.z * dt;
+
+      // Quaternion integration (from nudge: dr = angVel * quat * halfDt)
+      const angVel = {x: body.angularVelocity.x, y: body.angularVelocity.y, z: body.angularVelocity.z};
+      const dr = Quat.multiply(
+        {x: angVel.x, y: angVel.y, z: angVel.z, w: 0},
+        body.rotation
+      );
+
+      body.rotation.x += dr.x * halfDt;
+      body.rotation.y += dr.y * halfDt;
+      body.rotation.z += dr.z * halfDt;
+      body.rotation.w += dr.w * halfDt;
+
+      // Normalize quaternion
+      body.rotation = Quat.normalize(body.rotation);
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Main simulation step
+  // -----------------------------------------------------------------------
+
+  simulate(dt) {
+    const steps = 2;
+    const subDt = dt / steps;
+
+    for (let s = 0; s < steps; s++) {
+      // Collision detection
+      this.collide();
+
+      // Apply gravity and damping for active bodies
+      const damping = 1.0 - subDt * DAMPING;
+      for (const idx of this.activeBodies) {
+        const body = this.bodies[idx];
+        body.velocity.y += GRAVITY * subDt;
+        body.velocity.x *= damping;
+        body.velocity.y *= damping;
+        body.velocity.z *= damping;
+        body.angularVelocity.x *= damping;
+        body.angularVelocity.y *= damping;
+        body.angularVelocity.z *= damping;
+      }
+
+      // Solve constraints
+      this.solve();
+
+      // Advance bodies
+      this.advance(subDt);
+    }
+  }
+
+  // Apply an impulse to a body (for mouse interaction)
+  applyImpulse(bodyIndex, impulse, point) {
+    const body = this.bodies[bodyIndex];
+    if (!body || body.massInverse === 0) return;
+
+    body.velocity = Vec3.add(body.velocity, Vec3.scale(impulse, body.massInverse));
+
+    if (point) {
+      const r = Vec3.sub(point, body.position);
+      const torque = Vec3.cross(r, impulse);
+      body.angularVelocity = Vec3.add(body.angularVelocity,
+        Vec3.create(torque.x * body.inertiaInverse.x,
+                    torque.y * body.inertiaInverse.y,
+                    torque.z * body.inertiaInverse.z));
+    }
+
+    body.idleCounter = 0;
+  }
+
+  // Apply force to body at point (used for mouse drag)
+  applyForce(bodyIndex, force, point) {
+    const body = this.bodies[bodyIndex];
+    if (!body || body.massInverse === 0) return;
+
+    body.velocity = Vec3.add(body.velocity, Vec3.scale(force, body.massInverse));
+
+    if (point) {
+      const r = Vec3.sub(point, body.position);
+      const torque = Vec3.cross(r, force);
+      body.angularVelocity = Vec3.add(body.angularVelocity,
+        Vec3.create(torque.x * body.inertiaInverse.x,
+                    torque.y * body.inertiaInverse.y,
+                    torque.z * body.inertiaInverse.z));
+    }
+  }
+}
+
+// ============================================================================
+// Three.js Rendering
+// ============================================================================
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+scene.fog = new THREE.Fog(0x1a1a2e, 80, 200);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera.position.set(0, 20, 35);
+camera.lookAt(0, 10, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.target.set(0, 10, 0);
+
+// Lighting
+const ambientLight = new THREE.AmbientLight(0x404060, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(20, 40, 20);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -50;
+dirLight.shadow.camera.right = 50;
+dirLight.shadow.camera.top = 50;
+dirLight.shadow.camera.bottom = -50;
+scene.add(dirLight);
+
+const hemiLight = new THREE.HemisphereLight(0x606080, 0x303040, 0.5);
+scene.add(hemiLight);
+
+// ============================================================================
+// Physics world setup
+// ============================================================================
+
+const world = new PhysicsWorld();
+
+// Three.js mesh tracking
+const meshes = []; // {mesh, colliderIndex}
+
+function createBoxMesh(halfExtents, color) {
+  const geometry = new THREE.BoxGeometry(
+    halfExtents[0] * 2, halfExtents[1] * 2, halfExtents[2] * 2
+  );
+  const material = new THREE.MeshStandardMaterial({
+    color,
+    roughness: 0.4,
+    metalness: 0.1,
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  return mesh;
+}
+
+function createSphereMesh(radius, color) {
+  const geometry = new THREE.SphereGeometry(radius, 16, 12);
+  const material = new THREE.MeshStandardMaterial({
+    color,
+    roughness: 0.3,
+    metalness: 0.2,
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  return mesh;
+}
+
+// Ground plane (at top of physics ground box)
+const groundGeo = new THREE.PlaneGeometry(200, 200);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x2a2a4a, roughness: 0.8 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -15; // top of physics ground box (center -20, halfHeight 5)
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Grid helper
+const grid = new THREE.GridHelper(100, 50, 0x3a3a5a, 0x2a2a4a);
+grid.position.y = -14.99;
+scene.add(grid);
+
+// Colors
+function randomColor() {
+  const colors = [
+    0xe74c3c, 0xe67e22, 0xf39c12, 0xf1c40f, 0x2ecc71,
+    0x1abc9c, 0x3498db, 0x9b59b6, 0xe91e63, 0x00bcd4,
+    0xff6b6b, 0xffa726, 0xffee58, 0x66bb6a, 0x26c6da,
+    0x42a5f5, 0x7e57c2, 0xec407a, 0x8d6e63, 0x78909c,
+  ];
+  return colors[Math.floor(Math.random() * colors.length)];
+}
+
+// ============================================================================
+// Scene setup functions
+// ============================================================================
+
+function setupScene() {
+  // Clear existing bodies and meshes
+  for (const m of meshes) {
+    scene.remove(m.mesh);
+    m.mesh.geometry.dispose();
+    m.mesh.material.dispose();
+  }
+  meshes.length = 0;
+  world.bodies.length = 1; // Keep static world body
+  world.colliders.length = 0;
+  world.contactCache.length = 0;
+
+  // Add ground as a STATIC collider on body 0 (the world body)
+  const groundColIndex = world.addStaticBox([200, 5, 200], {x:0,y:-20,z:0});
+  meshes.push({mesh: ground, colliderIndex: groundColIndex, isGround: true});
+
+  // Add boxes in a stack formation
+  for (let i = 0; i < 1; i++) {
+    const sx = Math.random() * 1.0 + 0.5;
+    const sy = Math.random() * 1.0 + 0.5;
+    const sz = Math.random() * 1.0 + 0.5;
+
+    const body = world.addBox(
+      [sx, sy, sz],
+      {
+        x: (Math.random() - 0.5) * 16,
+        y: Math.random() * 50 + 2,
+        z: (Math.random() - 0.5) * 16,
+      },
+      undefined,
+      sx * sy * sz * 8.0
+    );
+
+    const mesh = createBoxMesh([sx, sy, sz], randomColor());
+    meshes.push({mesh, colliderIndex: world.colliders.length - 1});
+  }
+
+  // Add spheres
+  for (let i = 0; i < 0; i++) {
+    const r = Math.random() * 0.5 + 0.3;
+
+    const body = world.addSphere(
+      r,
+      {
+        x: (Math.random() - 0.5) * 16,
+        y: Math.random() * 50 + 2,
+        z: (Math.random() - 0.5) * 16,
+      },
+      undefined,
+      4.18879 * r * r * r
+    );
+
+    const mesh = createSphereMesh(r, randomColor());
+    meshes.push({mesh, colliderIndex: world.colliders.length - 1});
+  }
+}
+
+// Expose to global for button handlers
+window.addBoxes = function() {
+  for (let i = 0; i < 30; i++) {
+    const sx = Math.random() * 1.0 + 0.5;
+    const sy = Math.random() * 1.0 + 0.5;
+    const sz = Math.random() * 1.0 + 0.5;
+
+    const body = world.addBox(
+      [sx, sy, sz],
+      {
+        x: (Math.random() - 0.5) * 10,
+        y: 50 + Math.random() * 20,
+        z: (Math.random() - 0.5) * 10,
+      },
+      undefined,
+      sx * sy * sz * 8.0
+    );
+
+    const mesh = createBoxMesh([sx, sy, sz], randomColor());
+    meshes.push({mesh, colliderIndex: world.colliders.length - 1});
+  }
+};
+
+window.addSpheres = function() {
+  for (let i = 0; i < 20; i++) {
+    const r = Math.random() * 0.5 + 0.3;
+
+    const body = world.addSphere(
+      r,
+      {
+        x: (Math.random() - 0.5) * 10,
+        y: 50 + Math.random() * 20,
+        z: (Math.random() - 0.5) * 10,
+      },
+      undefined,
+      4.18879 * r * r * r
+    );
+
+    const mesh = createSphereMesh(r, randomColor());
+    meshes.push({mesh, colliderIndex: world.colliders.length - 1});
+  }
+};
+
+window.resetScene = function() {
+  setupScene();
+};
+
+// ============================================================================
+// Mouse interaction (click to apply impulse)
+// ============================================================================
+
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let mouseDown = false;
+let dragBody = null;
+let prevMouseWorld = null;
+
+renderer.domElement.addEventListener('mousedown', (e) => {
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObjects(
+    meshes.filter(m => !m.isGround).map(m => m.mesh)
+  );
+
+  if (intersects.length > 0) {
+    const hit = intersects[0];
+    const meshData = meshes.find(m => m.mesh === hit.object);
+    if (meshData) {
+      const body = world.bodies[world.colliders[meshData.colliderIndex].body];
+      // Nudge the object upward and slightly random direction
+      const impulse = Vec3.create(
+        (Math.random() - 0.5) * 5,
+        8 + Math.random() * 12,
+        (Math.random() - 0.5) * 5
+      );
+      world.applyImpulse(world.colliders[meshData.colliderIndex].body, impulse, {x: hit.point.x, y: hit.point.y, z: hit.point.z});
+    }
+  }
+});
+
+// ============================================================================
+// Main loop
+// ============================================================================
+
+let lastTime = performance.now();
+let frameCount = 0;
+let fpsTime = 0;
+const fpsDisplay = document.getElementById('fps');
+const bodyCountDisplay = document.getElementById('bodyCount');
+const contactCountDisplay = document.getElementById('contactCount');
+
+function updateMeshes() {
+  for (const m of meshes) {
+    if (m.isGround) continue; // ground plane stays fixed
+    const collider = world.colliders[m.colliderIndex];
+    const body = world.bodies[collider.body];
+
+    // World position = body.position + rotated local position
+    const localOffset = Quat.rotateVec(body.rotation, collider.localPosition);
+    const worldPos = Vec3.add(body.position, localOffset);
+
+    m.mesh.position.set(worldPos.x, worldPos.y, worldPos.z);
+
+    // World rotation = body rotation * local rotation
+    const worldRot = Quat.multiply(body.rotation, collider.localRotation);
+    m.mesh.quaternion.set(worldRot.x, worldRot.y, worldRot.z, worldRot.w);
+  }
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const now = performance.now();
+  const dt = Math.min((now - lastTime) / 1000, 1/30); // Cap at 30fps worth of physics
+  lastTime = now;
+
+  // FPS counter
+  frameCount++;
+  fpsTime += dt;
+  if (fpsTime >= 0.5) {
+    fpsDisplay.textContent = Math.round(frameCount / fpsTime);
+    frameCount = 0;
+    fpsTime = 0;
+  }
+
+  // Physics simulation
+  world.simulate(dt);
+
+  // Update visual meshes
+  updateMeshes();
+
+  // Update UI
+  bodyCountDisplay.textContent = world.bodies.length - 1; // exclude static world
+  contactCountDisplay.textContent = world.contacts.length;
+
+  // Controls
+  controls.update();
+
+  // Render
+  renderer.render(scene, camera);
+}
+
+// Handle resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============================================================================
+// Initialize and run
+// ============================================================================
+
+setupScene();
+animate();
+
+</script>
+</body>
+</html>

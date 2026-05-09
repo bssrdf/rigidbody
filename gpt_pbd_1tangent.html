@@ -1,0 +1,1552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Stable Rigid Body Physics</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    overflow:hidden;
+    background:#0f1220;
+    font-family:Arial, Helvetica, sans-serif;
+  }
+  canvas { display:block; }
+
+  #ui {
+    position:absolute;
+    left:12px;
+    top:12px;
+    color:#fff;
+    background:rgba(0,0,0,0.7);
+    padding:14px 16px;
+    border-radius:10px;
+    line-height:1.5;
+    font-size:13px;
+    user-select:none;
+    pointer-events:none;
+  }
+
+  #stats {
+    position:absolute;
+    top:12px;
+    right:12px;
+    color:#fff;
+    background:rgba(0,0,0,0.7);
+    padding:12px;
+    border-radius:10px;
+    font-family:monospace;
+    font-size:12px;
+    pointer-events:none;
+  }
+
+  b { color:#ffd54f; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div style="font-size:16px;margin-bottom:6px">Stable Sequential Impulse Physics</div>
+  <div><b>Click</b> or <b>Space</b> → Shoot sphere</div>
+  <div><b>R</b> → Reset scene</div>
+  <div><b>Mouse</b> → Orbit camera</div>
+</div>
+
+<div id="stats"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+<script>
+(() => {
+'use strict';
+
+const EPS = 1e-8;
+const DT = 1 / 60;
+const SUBSTEPS = 8;
+const ITERATIONS = 20;
+const GRAVITY = -9.81;
+const BAUMGARTE = 0.2;
+const ALLOWED_PENETRATION = 0.001;
+
+/* =========================================================
+ * Vector
+ * =======================================================*/
+class Vec3 {
+  constructor(x=0,y=0,z=0){
+    this.x=x;
+    this.y=y;
+    this.z=z;
+  }
+
+  set(x,y,z){
+    this.x=x;
+    this.y=y;
+    this.z=z;
+    return this;
+  }
+
+  clone(){
+    return new Vec3(this.x,this.y,this.z);
+  }
+
+  copy(v){
+    this.x=v.x;
+    this.y=v.y;
+    this.z=v.z;
+    return this;
+  }
+
+  add(v){
+    return new Vec3(this.x+v.x,this.y+v.y,this.z+v.z);
+  }
+
+  sub(v){
+    return new Vec3(this.x-v.x,this.y-v.y,this.z-v.z);
+  }
+
+  scale(s){
+    return new Vec3(this.x*s,this.y*s,this.z*s);
+  }
+
+  addEq(v){
+    this.x+=v.x;
+    this.y+=v.y;
+    this.z+=v.z;
+    return this;
+  }
+
+  subEq(v){
+    this.x-=v.x;
+    this.y-=v.y;
+    this.z-=v.z;
+    return this;
+  }
+
+  scaleEq(s){
+    this.x*=s;
+    this.y*=s;
+    this.z*=s;
+    return this;
+  }
+
+  dot(v){
+    return this.x*v.x + this.y*v.y + this.z*v.z;
+  }
+
+  cross(v){
+    return new Vec3(
+      this.y*v.z - this.z*v.y,
+      this.z*v.x - this.x*v.z,
+      this.x*v.y - this.y*v.x
+    );
+  }
+
+  length(){
+    return Math.sqrt(this.x*this.x + this.y*this.y + this.z*this.z);
+  }
+
+  lengthSq(){
+    return this.x*this.x + this.y*this.y + this.z*this.z;
+  }
+
+  normalize(){
+    const l = this.length();
+    if(l > EPS){
+      this.x/=l;
+      this.y/=l;
+      this.z/=l;
+    }
+    return this;
+  }
+
+  normalized(){
+    return this.clone().normalize();
+  }
+
+  negate(){
+    return new Vec3(-this.x,-this.y,-this.z);
+  }
+}
+
+/* =========================================================
+ * Quaternion
+ * =======================================================*/
+class Quat {
+  constructor(x=0,y=0,z=0,w=1){
+    this.x=x;
+    this.y=y;
+    this.z=z;
+    this.w=w;
+  }
+
+  normalize(){
+    const l = Math.sqrt(this.x*this.x + this.y*this.y + this.z*this.z + this.w*this.w);
+    if(l > EPS){
+      this.x/=l;
+      this.y/=l;
+      this.z/=l;
+      this.w/=l;
+    }
+    return this;
+  }
+
+  mul(q){
+    const ax=this.x, ay=this.y, az=this.z, aw=this.w;
+    const bx=q.x, by=q.y, bz=q.z, bw=q.w;
+
+    this.x = aw*bx + ax*bw + ay*bz - az*by;
+    this.y = aw*by - ax*bz + ay*bw + az*bx;
+    this.z = aw*bz + ax*by - ay*bx + az*bw;
+    this.w = aw*bw - ax*bx - ay*by - az*bz;
+
+    return this;
+  }
+
+  rotate(v){
+    const qv = new Vec3(this.x,this.y,this.z);
+    const uv = qv.cross(v);
+    const uuv = qv.cross(uv);
+
+    uv.scaleEq(2 * this.w);
+    uuv.scaleEq(2);
+
+    return v.add(uv).add(uuv);
+  }
+}
+
+function integrateQuat(q, omega, dt){
+  const angle = omega.length();
+  if(angle < EPS) return;
+
+  const axis = omega.scale(1 / angle);
+  const half = angle * dt * 0.5;
+  const s = Math.sin(half);
+
+  const dq = new Quat(
+    axis.x * s,
+    axis.y * s,
+    axis.z * s,
+    Math.cos(half)
+  );
+
+  q.mul(dq).normalize();
+}
+
+/* =========================================================
+ * Body
+ * =======================================================*/
+class Body {
+  constructor(opts={}){
+    this.type = opts.type || 'dynamic';
+    this.shape = opts.shape || 'box';
+
+    this.position = new Vec3(opts.x||0, opts.y||0, opts.z||0);
+    this.rotation = opts.rotation || new Quat();
+
+    this.velocity = new Vec3(opts.vx||0, opts.vy||0, opts.vz||0);
+    this.angularVelocity = new Vec3(opts.wx||0, opts.wy||0, opts.wz||0);
+
+    this.halfExtents = new Vec3(opts.hx||0.5, opts.hy||0.5, opts.hz||0.5);
+    this.radius = opts.radius || 0.5;
+
+    this.mass = this.type === 'static' ? 0 : (opts.mass || 1);
+    this.invMass = this.mass > 0 ? 1 / this.mass : 0;
+
+    this.restitution = opts.restitution ?? 0.05;
+    this.friction = opts.friction ?? 0.6;
+
+    this.color = opts.color || 0xffffff;
+
+    this.sleepTime = 0;
+    this.sleeping = false;
+
+    this.invInertiaLocal = new Vec3();
+    this.computeInertia();
+  }
+
+  computeInertia(){
+    if(this.type === 'static') return;
+
+    if(this.shape === 'sphere'){
+      const i = 2/5 * this.mass * this.radius * this.radius;
+      const inv = 1 / i;
+      this.invInertiaLocal.set(inv,inv,inv);
+      return;
+    }
+
+    const hx = this.halfExtents.x * 2;
+    const hy = this.halfExtents.y * 2;
+    const hz = this.halfExtents.z * 2;
+
+    const ix = (1/12) * this.mass * (hy*hy + hz*hz);
+    const iy = (1/12) * this.mass * (hx*hx + hz*hz);
+    const iz = (1/12) * this.mass * (hx*hx + hy*hy);
+
+    this.invInertiaLocal.set(1/ix,1/iy,1/iz);
+  }
+
+  getAxis(i){
+    if(i===0) return this.rotation.rotate(new Vec3(1,0,0));
+    if(i===1) return this.rotation.rotate(new Vec3(0,1,0));
+    return this.rotation.rotate(new Vec3(0,0,1));
+  }
+
+  worldPoint(local){
+    return this.rotation.rotate(local).add(this.position);
+  }
+
+  inverseInertiaWorldMul(v){
+    const xAxis = this.getAxis(0);
+    const yAxis = this.getAxis(1);
+    const zAxis = this.getAxis(2);
+
+    const lx = v.dot(xAxis) * this.invInertiaLocal.x;
+    const ly = v.dot(yAxis) * this.invInertiaLocal.y;
+    const lz = v.dot(zAxis) * this.invInertiaLocal.z;
+
+    return xAxis.scale(lx)
+      .add(yAxis.scale(ly))
+      .add(zAxis.scale(lz));
+  }
+}
+
+/* =========================================================
+ * Contact
+ * =======================================================*/
+class Contact {
+  constructor(){
+    this.a = null;
+    this.b = null;
+
+    this.point = new Vec3();
+    this.normal = new Vec3();
+    this.penetration = 0;
+
+    this.normalImpulse = 0;
+    this.tangentImpulse = 0;
+
+    // this.tangentImpulse2 = 0;
+
+    this.normalMass = 0;
+    this.tangentMass = 0;
+
+    // this.tangentMass2 = 0;
+
+    this.bias = 0;
+  }
+}
+
+/* =========================================================
+ * Collision
+ * =======================================================*/
+function sphereSphere(a,b,out){
+  const delta = b.position.sub(a.position);
+  const distSq = delta.lengthSq();
+  const r = a.radius + b.radius;
+
+  if(distSq > r*r) return;
+
+  const dist = Math.sqrt(Math.max(distSq, EPS));
+  const n = delta.scale(1 / dist);
+
+  const c = new Contact();
+  c.a = a;
+  c.b = b;
+  c.normal = n;
+  c.penetration = r - dist;
+  c.point = a.position.add(n.scale(a.radius - c.penetration * 0.5));
+
+  out.push(c);
+}
+
+function closestPointOnOBB(point, box){
+  const d = point.sub(box.position);
+  const result = box.position.clone();
+
+  const axes = [box.getAxis(0), box.getAxis(1), box.getAxis(2)];
+  const he = box.halfExtents;
+  const ext = [he.x, he.y, he.z];
+
+  for(let i=0;i<3;i++){
+    let dist = d.dot(axes[i]);
+    dist = Math.max(-ext[i], Math.min(ext[i], dist));
+    result.addEq(axes[i].scale(dist));
+  }
+
+  return result;
+}
+
+function sphereBox(sphere, box, out){
+  const axes = [box.getAxis(0), box.getAxis(1), box.getAxis(2)];
+  const he = box.halfExtents;
+
+  const rel = sphere.position.sub(box.position);
+
+  let localX = rel.dot(axes[0]);
+  let localY = rel.dot(axes[1]);
+  let localZ = rel.dot(axes[2]);
+
+  const clampedX = Math.max(-he.x, Math.min(he.x, localX));
+  const clampedY = Math.max(-he.y, Math.min(he.y, localY));
+  const clampedZ = Math.max(-he.z, Math.min(he.z, localZ));
+
+  const closest = box.position
+    .add(axes[0].scale(clampedX))
+    .add(axes[1].scale(clampedY))
+    .add(axes[2].scale(clampedZ));
+
+  const delta = sphere.position.sub(closest);
+  const distSq = delta.lengthSq();
+
+  if(distSq > sphere.radius * sphere.radius) return;
+
+  let normal;
+  let penetration;
+
+  const isInside = Math.abs(localX) <= he.x && Math.abs(localY) <= he.y && Math.abs(localZ) <= he.z;
+
+  if(isInside){
+    const dx = he.x - Math.abs(localX);
+    const dy = he.y - Math.abs(localY);
+    const dz = he.z - Math.abs(localZ);
+
+    if(dx < dy && dx < dz){
+      normal = axes[0].scale(localX > 0 ? 1 : -1);
+      penetration = sphere.radius - dx;
+    } else if(dy < dz){
+      normal = axes[1].scale(localY > 0 ? 1 : -1);
+      penetration = sphere.radius - dy;
+    } else {
+      normal = axes[2].scale(localZ > 0 ? 1 : -1);
+      penetration = sphere.radius - dz;
+    }
+    // console.log("A", sphere.radius, normal, penetration);
+  } else {
+    const dist = Math.sqrt(distSq);
+    normal = delta.scale(1 / dist);
+    penetration = sphere.radius - dist;
+    // console.log("B", sphere.radius, closest, normal, penetration);
+  }
+
+  const c = new Contact();
+  c.a = sphere;
+  c.b = box;
+  c.normal = normal.negate();
+  c.penetration = penetration;
+  c.point = closest;
+  out.push(c);
+}
+
+function projectBox(box, axis){
+  return (
+    Math.abs(axis.dot(box.getAxis(0))) * box.halfExtents.x +
+    Math.abs(axis.dot(box.getAxis(1))) * box.halfExtents.y +
+    Math.abs(axis.dot(box.getAxis(2))) * box.halfExtents.z
+  );
+}
+
+function generateEdgeContactPoints(a, b, bestInfo) {
+    const signCombo = [[-1,-1,-1],[1,-1,-1],[1,1,-1],[1,-1,1],
+                       [-1,-1,1],[-1,1,-1],[-1,1,1],[1,1,1]];
+
+    function buildVerts(box, axes, he) {
+        return signCombo.map(s =>
+            box.position
+                .add(axes[0].scale(s[0] * he.x))
+                .add(axes[1].scale(s[1] * he.y))
+                .add(axes[2].scale(s[2] * he.z))
+        );
+    }
+
+    const aAxes = [a.getAxis(0), a.getAxis(1), a.getAxis(2)];
+    const bAxes = [b.getAxis(0), b.getAxis(1), b.getAxis(2)];
+
+    const vertsA = buildVerts(a, aAxes, a.halfExtents);
+    const vertsB = buildVerts(b, bAxes, b.halfExtents);
+
+    // Edge maps for each axis (0=x, 1=y, 2=z)
+    const edgeMap = [
+        [[0,1],[2,3],[4,5],[6,7]],   // axis 0 (x)
+        [[0,4],[1,5],[2,6],[3,7]],   // axis 1 (y)
+        [[0,2],[1,3],[4,6],[5,7]]    // axis 2 (z)
+    ];
+
+    // Get the edges for the collision
+    const edgesA = edgeMap[bestInfo.edgeA];
+    const edgesB = edgeMap[bestInfo.edgeB];
+
+    // Find closest points on each pair of edges
+    const contacts = [];
+    const contactThreshold = 0.1; // Maximum distance to consider as contact
+
+    for(const [ai0, ai1] of edgesA) {
+        for(const [bi0, bi1] of edgesB) {
+            const cp = closestPointsOnSegments(
+                vertsA[ai0], vertsA[ai1],
+                vertsB[bi0], vertsB[bi1]
+            );
+
+            const dist = cp.pointA.sub(cp.pointB).length();
+
+            // Only keep contacts that are close enough
+            if(dist < contactThreshold) {
+                const contactPoint = cp.pointA.add(cp.pointB).scale(0.5);
+                contacts.push({
+                    point: contactPoint,
+                    distance: dist,
+                    paramA: cp.tA,
+                    paramB: cp.tB
+                });
+            }
+        }
+    }
+
+    // Sort contacts by distance (closest first)
+    contacts.sort((a, b) => a.distance - b.distance);
+
+    // Keep only unique contact points (cluster nearby points)
+    const uniqueContacts = [];
+    const clusterRadius = 0.05;
+
+    for(const contact of contacts) {
+        let isUnique = true;
+        for(const unique of uniqueContacts) {
+            if(contact.point.sub(unique.point).length() < clusterRadius) {
+                isUnique = false;
+                break;
+            }
+        }
+        if(isUnique) {
+            uniqueContacts.push(contact);
+        }
+    }
+
+    // If we found edge-edge contacts, use them
+    if(uniqueContacts.length > 0) {
+        return uniqueContacts.map(c => c.point);
+    }
+
+    // Fallback: Check for vertex-face contacts
+    // Try vertices of A against faces of B
+    for(const vert of vertsA) {
+        const closestOnB = closestPointOnBox(vert, b, bAxes);
+        const dist = vert.sub(closestOnB).length();
+
+        if(dist < contactThreshold) {
+            uniqueContacts.push({
+                point: vert.add(closestOnB).scale(0.5),
+                distance: dist
+            });
+        }
+    }
+
+    // Try vertices of B against faces of A
+    for(const vert of vertsB) {
+        const closestOnA = closestPointOnBox(vert, a, aAxes);
+        const dist = vert.sub(closestOnA).length();
+
+        if(dist < contactThreshold) {
+            uniqueContacts.push({
+                point: vert.add(closestOnA).scale(0.5),
+                distance: dist
+            });
+        }
+    }
+
+    // Sort by distance and keep closest
+    uniqueContacts.sort((a, b) => a.distance - b.distance);
+
+    // Return up to 4 closest unique points
+    const result = [];
+    for(let i = 0; i < Math.min(4, uniqueContacts.length); i++) {
+        let isUnique = true;
+        for(const existing of result) {
+            if(uniqueContacts[i].point.sub(existing).length() < clusterRadius) {
+                isUnique = false;
+                break;
+            }
+        }
+        if(isUnique) {
+            result.push(uniqueContacts[i].point);
+        }
+    }
+
+    return result;
+}
+
+// Helper function to find closest point on a box
+function closestPointOnBox(point, box, axes) {
+    const d = point.sub(box.position);
+    const result = box.position.clone();
+    const he = box.halfExtents;
+    const ext = [he.x, he.y, he.z];
+
+    for(let i = 0; i < 3; i++) {
+        let dist = d.dot(axes[i]);
+        dist = Math.max(-ext[i], Math.min(ext[i], dist));
+        result.addEq(axes[i].scale(dist));
+    }
+
+    return result;
+}
+
+// Helper function for closest points between two line segments
+function closestPointsOnSegments(p0, p1, q0, q1) {
+    const d1 = p1.sub(p0);
+    const d2 = q1.sub(q0);
+
+    const a = d1.lengthSq();
+    const e = d2.lengthSq();
+
+    if(a < 1e-10 && e < 1e-10) {
+        return {
+            pointA: p0.clone(),
+            pointB: q0.clone(),
+            tA: 0,
+            tB: 0
+        };
+    }
+
+    if(a < 1e-10) {
+        const tB = Math.max(0, Math.min(1, q0.sub(p0).dot(d2) / e));
+        return {
+            pointA: p0.clone(),
+            pointB: q0.add(d2.scale(tB)),
+            tA: 0,
+            tB: tB
+        };
+    }
+
+    if(e < 1e-10) {
+        const tA = Math.max(0, Math.min(1, p0.sub(q0).dot(d1) / a));
+        return {
+            pointA: p0.add(d1.scale(tA)),
+            pointB: q0.clone(),
+            tA: tA,
+            tB: 0
+        };
+    }
+
+    const f = d2.dot(d1);
+    const d = p0.sub(q0);
+    const c = d.dot(d1);
+    const b = d.dot(d2);
+
+    const denom = a * e - f * f;
+
+    let tA, tB;
+
+    if(denom < 1e-10) {
+        // Parallel lines
+        tA = 0;
+        tB = Math.max(0, Math.min(1, -b / e));
+    } else {
+        tA = Math.max(0, Math.min(1, (b * f - c * e) / denom));
+        tB = Math.max(0, Math.min(1, (a * b - f * c + tA * (f * e - a * f)) / denom));
+
+        // Refine solution
+        tA = Math.max(0, Math.min(1, (c + f * tB) / a));
+        tB = Math.max(0, Math.min(1, (b - f * tA) / e));
+    }
+
+    return {
+        pointA: p0.add(d1.scale(tA)),
+        pointB: q0.add(d2.scale(tB)),
+        tA: tA,
+        tB: tB
+    };
+}
+
+
+function boxBox(a,b,out){
+  const aAxes = [a.getAxis(0), a.getAxis(1), a.getAxis(2)];
+  const bAxes = [b.getAxis(0), b.getAxis(1), b.getAxis(2)];
+
+  const axes = [];
+
+  for(let i=0;i<3;i++) axes.push({ axis:aAxes[i], type:'faceA', index:i });
+  for(let i=0;i<3;i++) axes.push({ axis:bAxes[i], type:'faceB', index:i });
+
+  for(let i=0;i<3;i++){
+    for(let j=0;j<3;j++){
+      const c = aAxes[i].cross(bAxes[j]);
+      if(c.lengthSq() > 1e-8){
+        axes.push({ axis:c.normalized(), type:'edge', edgeA:i, edgeB:j });
+      }
+    }
+  }
+
+  const delta = b.position.sub(a.position);
+
+  let bestAxis = null;
+  let bestInfo = null;
+  let minPen = 1e9;
+
+  for(const info of axes){
+    const axis = info.axis;
+
+    const ra = projectBox(a, axis);
+    const rb = projectBox(b, axis);
+
+    const dist = Math.abs(delta.dot(axis));
+    const pen = ra + rb - dist;
+
+    if(pen < 0) return;
+
+    if(pen < minPen){
+      minPen = pen;
+      bestAxis = axis;
+      bestInfo = info;
+    }
+  }
+
+  if(delta.dot(bestAxis) < 0){
+    bestAxis = bestAxis.negate();
+  }
+
+  /* edge-edge fallback */
+  // if(bestInfo.type === 'edge'){
+  //   const c = new Contact();
+  //   c.a = a;
+  //   c.b = b;
+  //   c.normal = bestAxis;
+  //   c.penetration = minPen;
+  //   c.point = a.position.add(b.position).scale(0.5);
+  //   out.push(c);
+  //   return;
+  // }
+  if(bestInfo.type === 'edge'){
+      //  // Build world-space vertices for each box (8 corners):
+      //  const signCombo = [[-1,-1,-1],[1,-1,-1],[1,1,-1],[1,-1,1],
+      //                     [-1,-1,1],[-1,1,-1],[-1,1,1],[1,1,1]];
+
+      //  function buildVerts(box, axes, he) {
+      //      return signCombo.map(s =>
+      //          box.position
+      //              .add(axes[0].scale(s[0] * he.x))
+      //              .add(axes[1].scale(s[1] * he.y))
+      //              .add(axes[2].scale(s[2] * he.z))
+      //      );
+      //  }
+
+      //  const vertsA = buildVerts(a, aAxes, a.halfExtents);
+      //  const vertsB = buildVerts(b, bAxes, b.halfExtents);
+
+      //  // Edge index map: for axis i, return the 4 edges (each as [vStart, vEnd] indices)
+      //  // axis 0 (x) edges:   [0,1],[2,3],[4,5],[6,7]
+      //  // axis 1 (y) edges:   [0,4],[1,5],[2,6],[3,7]
+      //  // axis 2 (z) edges:   [0,2],[1,3],[4,6],[5,7]
+      //  const edgeMap = [
+      //      [[0,1],[2,3],[4,5],[6,7]],   // axis 0
+      //      [[0,4],[1,5],[2,6],[3,7]],   // axis 1
+      //      [[0,2],[1,3],[4,6],[5,7]]    // axis 2
+      //  ];
+
+      //  // Closest points on two line segments (parametric, clamped)
+      //  function closestOnSegments(p0, p1, q0, q1) {
+      //      const d1 = p1.sub(p0);
+      //      const d2 = q1.sub(q0);
+      //      const a = d1.lengthSq();
+      //      const e = d2.lengthSq();
+      //      const f = d2.dot(d1);
+      //      const d = p0.sub(q0);
+      //      const c = d.dot(d1);
+      //      const b = d.dot(d2);
+      //      const denom = a * e - f * f;
+
+      //      let s, t;
+      //      if(denom < 1e-10){
+      //          s = 0;
+      //          t = Math.max(0, Math.min(1, -b / Math.max(e, 1e-10)));
+      //      } else {
+      //          s = Math.max(0, Math.min(1, (b*f - c*e) / denom));
+      //          t = Math.max(0, Math.min(1, (a*b - f*c + s*(f*e - a*f)) / (denom + 1e-10)));
+      //          s = Math.max(0, Math.min(1, (c + f*t) / Math.max(a, 1e-10)));
+      //      }
+
+      //      return {
+      //          p: p0.add(d1.scale(s)),
+      //          q: q0.add(d2.scale(t))
+      //      };
+      //  }
+
+      //  // Find the closest pair among the 4×4 edge combinations
+      //  let bestDistSq = Infinity;
+      //  let bestCP = null;
+
+      //  const edgesA = edgeMap[bestInfo.edgeA];
+      //  const edgesB = edgeMap[bestInfo.edgeB];
+
+      //  for(const [ai0, ai1] of edgesA){
+      //      for(const [bi0, bi1] of edgesB){
+      //          const cp = closestOnSegments(
+      //              vertsA[ai0], vertsA[ai1],
+      //              vertsB[bi0], vertsB[bi1]
+      //          );
+      //          const d = cp.q.sub(cp.p);
+      //          const dSq = d.lengthSq();
+      //          if(dSq < bestDistSq){
+      //              bestDistSq = dSq;
+      //              bestCP = cp;
+      //          }
+      //      }
+      //  }
+
+      //  const contactPoint = bestCP !== null
+      //      ? bestCP.p.add(bestCP.q).scale(0.5)
+      //      : a.position.add(b.position).scale(0.5);  // safety fallback
+
+      //  const c = new Contact();
+      //  c.a = a;
+      //  c.b = b;
+      //  c.normal = bestAxis;
+      //  c.penetration = minPen;
+      //  c.point = contactPoint;
+      //  out.push(c);
+      //  return;
+
+    const contactPoints = generateEdgeContactPoints(a, b, bestInfo);
+
+    if(contactPoints.length > 0) {
+        for(const point of contactPoints) {
+            const c = new Contact();
+            c.a = a;
+            c.b = b;
+            c.normal = bestAxis;
+            c.penetration = minPen;
+            c.point = point;
+            out.push(c);
+        }
+    } else {
+        // Fallback if no points found
+        const c = new Contact();
+        c.a = a;
+        c.b = b;
+        c.normal = bestAxis;
+        c.penetration = minPen;
+        c.point = a.position.add(b.position).scale(0.5);
+        out.push(c);
+    }
+    return;
+  }
+
+  let refBox, incBox;
+  let refAxes, incAxes;
+  let refFaceIndex;
+  let normal = bestAxis;
+
+  if(bestInfo.type === 'faceA'){
+    refBox = a;
+    incBox = b;
+    refAxes = aAxes;
+    incAxes = bAxes;
+    refFaceIndex = bestInfo.index;
+  } else {
+    refBox = b;
+    incBox = a;
+    refAxes = bAxes;
+    incAxes = aAxes;
+    refFaceIndex = bestInfo.index;
+    normal = normal.negate();
+  }
+
+  /* choose incident face */
+  let incidentIndex = 0;
+  let minDot = 1e9;
+
+
+  for(let i=0;i<3;i++){
+    var d = incAxes[i].dot(normal);
+    if(d < minDot){
+      minDot = d;
+      incidentIndex = i;
+    }
+    d = incAxes[i].negate().dot(normal);
+    if(d < minDot){
+      minDot = d;
+      incidentIndex = i;
+    }
+    // console.log("i ", i, d, minDot, incidentIndex, incAxes[i]);
+  }
+
+  const incNormal = incAxes[incidentIndex];
+  const sign = incNormal.dot(normal) < 0 ? 1 : -1;
+
+  const incCenter = incBox.position.add(
+    incNormal.scale(sign * incBox.halfExtents[['x','y','z'][incidentIndex]])
+  );
+
+  const side1 = incAxes[(incidentIndex + 1) % 3];
+  const side2 = incAxes[(incidentIndex + 2) % 3];
+
+  const e1 = incBox.halfExtents[['x','y','z'][(incidentIndex + 1) % 3]];
+  const e2 = incBox.halfExtents[['x','y','z'][(incidentIndex + 2) % 3]];
+
+  const verts = [
+    incCenter.add(side1.scale( e1)).add(side2.scale( e2)),
+    incCenter.add(side1.scale(-e1)).add(side2.scale( e2)),
+    incCenter.add(side1.scale(-e1)).add(side2.scale(-e2)),
+    incCenter.add(side1.scale( e1)).add(side2.scale(-e2))
+  ];
+  // console.log("Verts", verts);
+  // console.log("normal", normal, incidentIndex, incCenter, side1, side2, e1, e2); ;
+
+  const refNormal = refAxes[refFaceIndex];
+  const refExtent = refBox.halfExtents[['x','y','z'][refFaceIndex]];
+
+  const refCenter = refBox.position.add(
+    refNormal.scale(refExtent * (refNormal.dot(normal) > 0 ? 1 : -1))
+  );
+
+  const refSide1 = refAxes[(refFaceIndex + 1) % 3];
+  const refSide2 = refAxes[(refFaceIndex + 2) % 3];
+
+  const refE1 = refBox.halfExtents[['x','y','z'][(refFaceIndex + 1) % 3]];
+  const refE2 = refBox.halfExtents[['x','y','z'][(refFaceIndex + 2) % 3]];
+
+  function insideRefFace(p){
+    const d = p.sub(refCenter);
+
+    const u = d.dot(refSide1);
+    const v = d.dot(refSide2);
+    const w = d.dot(normal);
+
+    return (
+      Math.abs(u) <= refE1 + 0.02 &&
+      Math.abs(v) <= refE2 + 0.02 &&
+      // Math.abs(u) <= refE1 * 0.02 &&
+      // Math.abs(v) <= refE2 * 0.02 &&
+      w <= 0.05
+    );
+  }
+
+  let count = 0;
+
+  for(const v of verts){
+    if(!insideRefFace(v)) continue;
+
+    const c = new Contact();
+    c.a = a;
+    c.b = b;
+    c.normal = bestAxis;
+    c.penetration = minPen;
+    c.point = v.sub(normal.scale(v.sub(refCenter).dot(normal)));
+
+    out.push(c);
+    count++;
+  }
+
+  // console.log("count", count);
+  // console.log(out);
+
+
+  /* fallback */
+  if(count === 0){
+    const c = new Contact();
+    c.a = a;
+    c.b = b;
+    c.normal = bestAxis;
+    c.penetration = minPen;
+    c.point = refCenter;
+    out.push(c);
+  }
+}
+
+function collide(a,b,out){
+  if(a.shape==='sphere' && b.shape==='sphere'){
+    sphereSphere(a,b,out);
+    return;
+  }
+
+  if(a.shape==='sphere' && b.shape==='box'){
+    sphereBox(a,b,out);
+    return;
+  }
+
+  if(a.shape==='box' && b.shape==='sphere'){
+    sphereBox(b,a,out);
+
+    if(out.length){
+      const c = out[out.length-1];
+      c.normal = c.normal.negate();
+      const tmp = c.a;
+      c.a = c.b;
+      c.b = tmp;
+    }
+    return;
+  }
+
+  if(a.shape==='box' && b.shape==='box'){
+    boxBox(a,b,out);
+  }
+}
+
+/* =========================================================
+ * Physics World
+ * =======================================================*/
+class PhysicsWorld {
+  constructor(){
+    this.bodies = [];
+    this.contacts = [];
+  }
+
+  addBody(b){
+    this.bodies.push(b);
+    return b;
+  }
+
+  step(dt){
+    const subDt = dt / SUBSTEPS;
+
+    for(let s=0;s<SUBSTEPS;s++){
+      this.integrate(subDt);
+      this.generateContacts();
+      this.preStep(subDt);
+      this.solve(subDt);
+      this.sleep(subDt);
+    }
+  }
+
+  integrate(dt){
+    for(const b of this.bodies){
+      if(b.type === 'static' || b.sleeping) continue;
+
+      b.velocity.y += GRAVITY * dt;
+
+      b.position.addEq(b.velocity.scale(dt));
+
+      integrateQuat(b.rotation, b.angularVelocity, dt);
+
+      /* improved damping */
+      b.velocity.scaleEq(0.998);
+      b.angularVelocity.scaleEq(0.992);
+
+      /* stop micro jitter */
+      if(b.velocity.lengthSq() < 1e-8){
+        b.velocity.set(0,0,0);
+      }
+
+      if(b.angularVelocity.lengthSq() < 1e-8){
+        b.angularVelocity.set(0,0,0);
+      }
+    }
+  }
+
+  generateContacts(){
+    this.contacts.length = 0;
+
+    for(let i=0;i<this.bodies.length;i++){
+      for(let j=i+1;j<this.bodies.length;j++){
+        const a = this.bodies[i];
+        const b = this.bodies[j];
+
+        if(a.type==='static' && b.type==='static') continue;
+
+        collide(a,b,this.contacts);
+      }
+    }
+  }
+
+  preStep(dt){
+    for(const c of this.contacts){
+      const a = c.a;
+      const b = c.b;
+
+      const ra = c.point.sub(a.position);
+      const rb = c.point.sub(b.position);
+
+      const rnA = ra.cross(c.normal);
+      const rnB = rb.cross(c.normal);
+
+      let kNormal = a.invMass + b.invMass;
+
+      if(a.type !== 'static'){
+        kNormal += rnA.dot(a.inverseInertiaWorldMul(rnA));
+      }
+
+      if(b.type !== 'static'){
+        kNormal += rnB.dot(b.inverseInertiaWorldMul(rnB));
+      }
+
+      c.normalMass = kNormal > EPS ? 1 / kNormal : 0;
+
+      // let tangent = new Vec3(-c.normal.z, 0, c.normal.x);
+      // if(tangent.lengthSq() < EPS){
+      //   tangent = new Vec3(1,0,0);
+      // }
+      // tangent.normalize();
+      const va2 = a.velocity.add(a.angularVelocity.cross(ra));
+      const vb2 = b.velocity.add(b.angularVelocity.cross(rb));
+
+      const rv2 = vb2.sub(va2);
+
+      let tangent = rv2.sub(c.normal.scale(rv2.dot(c.normal)));
+
+      const lenSq = tangent.lengthSq();
+      if(tangent.lengthSq() < EPS){
+        tangent = new Vec3(1,0,0);
+      }
+      // if(lenSq < EPS) return;
+
+      tangent.scaleEq(1 / Math.sqrt(lenSq));
+
+
+      const rtA = ra.cross(tangent);
+      const rtB = rb.cross(tangent);
+
+      let kTangent = a.invMass + b.invMass;
+
+      if(a.type !== 'static'){
+        kTangent += rtA.dot(a.inverseInertiaWorldMul(rtA));
+      }
+
+      if(b.type !== 'static'){
+        kTangent += rtB.dot(b.inverseInertiaWorldMul(rtB));
+      }
+
+      c.tangentMass = kTangent > EPS ? 1 / kTangent : 0;
+
+      c.bias = BAUMGARTE * Math.max(c.penetration - ALLOWED_PENETRATION, 0) / dt;
+    }
+  }
+
+  applyImpulse(body, impulse, r){
+    if(body.type === 'static') return;
+
+    // NEW: wake sleeping body on any impulse
+    if(body.sleeping){
+        body.sleeping = false;
+        body.sleepTime = 0;
+    }
+
+    body.velocity.addEq(impulse.scale(body.invMass));
+
+    const ang = body.inverseInertiaWorldMul(r.cross(impulse));
+    body.angularVelocity.addEq(ang);
+  }
+
+  solve(dt){
+    for(let iter=0; iter<ITERATIONS; iter++){
+      for(const c of this.contacts){
+        this.solveContact(c);
+      }
+    }
+
+    // for(const b of this.bodies){
+    //   if(b.type === 'static' || b.sleeping) continue;
+
+    //   b.position.addEq(b.velocity.scale(dt));
+    //   integrateQuat(b.rotation, b.angularVelocity, dt);
+    //  }
+
+
+    /* separate positional solver */
+    // for(const c of this.contacts){
+    //   this.solvePosition(c);
+    // }
+  }
+
+  solvePosition(c){
+    const a = c.a;
+    const b = c.b;
+
+    const totalInvMass = a.invMass + b.invMass;
+    if(totalInvMass <= EPS) return;
+
+    const correction = Math.max(c.penetration - 0.002, 0) * 0.35;
+
+    const correctionVec = c.normal.scale(correction / totalInvMass);
+
+    if(a.type !== 'static' && !a.sleeping){
+      a.position.subEq(correctionVec.scale(a.invMass));
+    }
+
+    if(b.type !== 'static' && !b.sleeping){
+      b.position.addEq(correctionVec.scale(b.invMass));
+    }
+  }
+
+  solveContact(c){
+    const a = c.a;
+    const b = c.b;
+
+    const ra = c.point.sub(a.position);
+    const rb = c.point.sub(b.position);
+
+    const va = a.velocity.add(a.angularVelocity.cross(ra));
+    const vb = b.velocity.add(b.angularVelocity.cross(rb));
+
+    const rv = vb.sub(va);
+
+    const vn = rv.dot(c.normal);
+
+    let impulseScalar = -(vn + c.bias) * c.normalMass;
+    // let impulseScalar = (c.bias - vn) * c.normalMass;
+
+    const oldImpulse = c.normalImpulse;
+    c.normalImpulse = Math.max(oldImpulse + impulseScalar, 0);
+    impulseScalar = c.normalImpulse - oldImpulse;
+
+    const normalImpulse = c.normal.scale(impulseScalar);
+
+    this.applyImpulse(a, normalImpulse.negate(), ra);
+    this.applyImpulse(b, normalImpulse, rb);
+
+    /* friction */
+    const va2 = a.velocity.add(a.angularVelocity.cross(ra));
+    const vb2 = b.velocity.add(b.angularVelocity.cross(rb));
+
+    const rv2 = vb2.sub(va2);
+
+    let tangent = rv2.sub(c.normal.scale(rv2.dot(c.normal)));
+
+    const lenSq = tangent.lengthSq();
+    if(lenSq < EPS) return;
+
+    tangent.scaleEq(1 / Math.sqrt(lenSq));
+
+    let jt = -rv2.dot(tangent);
+    jt *= c.tangentMass;
+
+    const mu = Math.sqrt(a.friction * b.friction);
+
+    const maxFriction = c.normalImpulse * mu;
+
+    const oldTangentImpulse = c.tangentImpulse;
+
+    c.tangentImpulse = Math.max(
+      -maxFriction,
+      Math.min(oldTangentImpulse + jt, maxFriction)
+    );
+
+    jt = c.tangentImpulse - oldTangentImpulse;
+
+    const frictionImpulse = tangent.scale(jt);
+
+    this.applyImpulse(a, frictionImpulse.negate(), ra);
+    this.applyImpulse(b, frictionImpulse, rb);
+
+  }
+
+  sleep(dt){
+    for(const b of this.bodies){
+      if(b.type === 'static') continue;
+
+      const energy = b.velocity.lengthSq() + b.angularVelocity.lengthSq();
+
+      if(energy < 0.002){
+        b.sleepTime += dt;
+
+        if(b.sleepTime > 1.0){
+          b.sleeping = true;
+          b.velocity.set(0,0,0);
+          b.angularVelocity.set(0,0,0);
+        }
+      } else {
+        b.sleepTime = 0;
+        b.sleeping = false;
+      }
+    }
+  }
+}
+
+/* =========================================================
+ * Three.js
+ * =======================================================*/
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x151825);
+
+const camera = new THREE.PerspectiveCamera(
+  55,
+  innerWidth / innerHeight,
+  0.1,
+  200
+);
+
+camera.position.set(12,10,14);
+
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0,2,0);
+
+scene.add(new THREE.AmbientLight(0xffffff,0.45));
+
+const light = new THREE.DirectionalLight(0xffffff,1.4);
+light.position.set(10,20,10);
+light.castShadow = true;
+scene.add(light);
+
+const floor = new THREE.Mesh(
+  new THREE.BoxGeometry(40,0.5,40),
+  new THREE.MeshStandardMaterial({
+    color:0x2b2f45,
+    roughness:0.9
+  })
+);
+
+floor.position.y = -0.25;
+floor.receiveShadow = true;
+scene.add(floor);
+
+scene.add(new THREE.GridHelper(40,40));
+
+/* =========================================================
+ * Physics Scene
+ * =======================================================*/
+const world = new PhysicsWorld();
+const meshMap = new Map();
+
+const palette = [
+  0xef5350,0xab47bc,0x5c6bc0,
+  0x29b6f6,0x26a69a,0x9ccc65,
+  0xffca28,0xff7043
+];
+
+function randomColor(){
+  return palette[(Math.random() * palette.length) | 0];
+}
+
+function addMesh(body){
+  let geometry;
+
+  if(body.shape === 'sphere'){
+    geometry = new THREE.SphereGeometry(body.radius, 24, 24);
+  } else {
+    geometry = new THREE.BoxGeometry(
+      body.halfExtents.x * 2,
+      body.halfExtents.y * 2,
+      body.halfExtents.z * 2
+    );
+  }
+
+  const material = new THREE.MeshStandardMaterial({
+    color:body.color,
+    roughness:0.5,
+    metalness:0.08
+  });
+
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+
+  scene.add(mesh);
+  meshMap.set(body, mesh);
+}
+
+function syncMeshes(){
+  for(const body of world.bodies){
+    const mesh = meshMap.get(body);
+    if(!mesh) continue;
+
+    mesh.position.set(
+      body.position.x,
+      body.position.y,
+      body.position.z
+    );
+
+    mesh.quaternion.set(
+      body.rotation.x,
+      body.rotation.y,
+      body.rotation.z,
+      body.rotation.w
+    );
+  }
+}
+
+function clearDynamic(){
+  const keep = [];
+
+  for(const body of world.bodies){
+    if(body.type === 'static'){
+      keep.push(body);
+      continue;
+    }
+
+    const mesh = meshMap.get(body);
+
+    if(mesh){
+      scene.remove(mesh);
+      mesh.geometry.dispose();
+      mesh.material.dispose();
+      meshMap.delete(body);
+    }
+  }
+
+  world.bodies = keep;
+}
+
+function resetScene(){
+  clearDynamic();
+
+  for(let y=10;y<10;y++){
+    for(let x=0;x<1;x++){
+      for(let z=0;z<1;z++){
+        const box = new Body({
+          shape:'box',
+          x:(x-3)*0.9,
+          y:0.5 + y*0.9,
+          z:(z-3)*0.9,
+          hx:0.4,
+          hy:0.4,
+          hz:0.4,
+          mass:1,
+          friction:0.8,
+          restitution:0.02,
+          color:randomColor()
+        });
+
+        world.addBody(box);
+        addMesh(box);
+      }
+    }
+  }
+}
+
+/* static floor body */
+world.addBody(new Body({
+  type:'static',
+  shape:'box',
+  x:0,
+  y:-0.25,
+  z:0,
+  hx:20,
+  hy:0.25,
+  hz:20
+}));
+
+resetScene();
+
+function shootBall(){
+
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+
+  const body = new Body({
+    shape:'sphere',
+    x:camera.position.x + dir.x * 2,
+    y:camera.position.y + dir.y * 2,
+    z:camera.position.z + dir.z * 2,
+    radius:0.45,
+    mass:3,
+    friction:0.5,
+    restitution:0.2,
+    vx:dir.x * 28,
+    vy:dir.y * 28,
+    vz:dir.z * 28,
+    color:0xffd54f
+  });
+
+  world.addBody(body);
+  addMesh(body);
+}
+
+function dropBox(){
+  let x = 0, y=10, z = 0;
+  const box = new Body({
+    shape:'box',
+    x:(x-3)*0.9,
+    y:0.5 + y*0.9,
+    z:(z-3)*0.9,
+    hx:0.4,
+    hy:0.4,
+    hz:0.4,
+    rotation: new Quat(0.25*Math.random(), 0.25*Math.random(), 0.25*Math.random()),
+    // wx:0.01,
+    // wy:0.005,
+    mass:1,
+    friction:0.8,
+    restitution:0.02,
+    color:randomColor()
+  });
+
+  world.addBody(box);
+  addMesh(box);
+}
+
+renderer.domElement.addEventListener('click', shootBall);
+
+window.addEventListener('keydown', e => {
+  if(e.code === 'Space'){
+    e.preventDefault();
+    shootBall();
+  }
+  if(e.code === 'KeyB'){
+    e.preventDefault();
+    dropBox();
+  }
+
+  if(e.code === 'KeyR'){
+    resetScene();
+  }
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* =========================================================
+ * Main Loop
+ * =======================================================*/
+const stats = document.getElementById('stats');
+const clock = new THREE.Clock();
+
+let accumulator = 0;
+let fpsTimer = 0;
+let fpsFrames = 0;
+let fps = 0;
+
+function animate(){
+  requestAnimationFrame(animate);
+
+  let frameDt = Math.min(clock.getDelta(), 0.05);
+
+  accumulator += frameDt;
+
+  let steps = 0;
+
+  while(accumulator >= DT && steps < 5){
+    world.step(DT);
+    accumulator -= DT;
+    steps++;
+  }
+
+  /* avoid spiral-of-death instability */
+  if(accumulator > DT * 5){
+    accumulator = 0;
+  }
+
+  syncMeshes();
+
+  controls.update();
+  renderer.render(scene, camera);
+
+  fpsFrames++;
+  fpsTimer += frameDt;
+
+  if(fpsTimer > 0.5){
+    fps = Math.round(fpsFrames / fpsTimer);
+    fpsFrames = 0;
+    fpsTimer = 0;
+  }
+
+  stats.innerHTML =
+    'FPS: ' + fps +
+    '<br>Bodies: ' + world.bodies.length +
+    '<br>Contacts: ' + world.contacts.length;
+}
+
+animate();
+
+})();
+</script>
+</body>
+</html>

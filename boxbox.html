@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>body{margin:0;overflow:hidden;background:#111;color:#eee;font-family:monospace}
+#info{position:absolute;top:10px;left:10px;z-index:1}</style>
+</head>
+<body>
+<div id="info">Drag sliders / move cubes to see manifold update</div>
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+               "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ======================================================================
+//  OBB (Oriented Bounding Box)
+// ======================================================================
+class OBB {
+    constructor(center, halfExtents, quaternion) {
+        this.c = center.clone();
+        this.h = halfExtents.clone();
+        this.q = quaternion.clone();
+        this.axes = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+        this.update();
+    }
+    update() {
+        const m = new THREE.Matrix4().makeRotationFromQuaternion(this.q).elements;
+        this.axes[0].set(m[0], m[1], m[2]);
+        this.axes[1].set(m[4], m[5], m[6]);
+        this.axes[2].set(m[8], m[9], m[10]);
+    }
+    // 8 world-space vertices
+    vertices() {
+        const v = [];
+        const s = [-1, 1];
+        for (const sx of s) for (const sy of s) for (const sz of s) {
+            v.push(new THREE.Vector3()
+                .addScaledVector(this.axes[0], sx * this.h.x)
+                .addScaledVector(this.axes[1], sy * this.h.y)
+                .addScaledVector(this.axes[2], sz * this.h.z)
+                .add(this.c));
+        }
+        return v;
+    }
+}
+
+// ======================================================================
+//  Core algorithm:
+
+// ======================================================================
+//  Core algorithm: SAT + clipping-based contact manifold
+// ======================================================================
+//
+//  Returns: { normal, points: [{position, depth}], featureType } or null
+//
+//  normal points from A -> B (push B out of A along +normal)
+// ======================================================================
+
+const EPS = 1e-6;
+
+function boxBoxManifold(A, B) {
+    // -------- 1. SAT: find axis of minimum penetration --------
+    // 15 candidate axes: 3 face normals of A, 3 of B, 9 cross products
+    const R   = [[0,0,0],[0,0,0],[0,0,0]]; // R[i][j] = A.axes[i] . B.axes[j]
+    const AbsR= [[0,0,0],[0,0,0],[0,0,0]];
+    for (let i=0;i<3;i++) for (let j=0;j<3;j++) {
+        R[i][j]    = A.axes[i].dot(B.axes[j]);
+        AbsR[i][j] = Math.abs(R[i][j]) + EPS;
+    }
+
+    const t = new THREE.Vector3().subVectors(B.c, A.c);
+    const tA = new THREE.Vector3(t.dot(A.axes[0]), t.dot(A.axes[1]), t.dot(A.axes[2]));
+
+    const ah = [A.h.x, A.h.y, A.h.z];
+    const bh = [B.h.x, B.h.y, B.h.z];
+
+
+    // const vertsA = A.vertices();
+    // const vertsB = B.vertices();
+    // for (let v in vertsA) {
+    //     console.log('A',vertsA[v]);
+    // }
+    // for (let v in vertsB) {
+    //     console.log('B',vertsB[v]);
+    // }
+
+    // let bestPen = -Infinity;
+    let bestPen = Infinity;
+    let bestAxis = new THREE.Vector3();
+    let bestCase = -1; // 0-2 face A, 3-5 face B, 6-14 edge-edge
+    let bestI = 0, bestJ = 0;
+
+    // Helper: test axis 'L' with projection radii rA, rB and center distance 'dist'.
+    // Penetration = rA + rB - |dist|. If <0 -> separated.
+    // We keep the axis with the *largest* penetration (i.e. least negative / smallest positive).
+    // Track face vs edge separately because face axes are preferred in case of ties
+    // (this avoids jittery edge-edge contacts when they are nearly coplanar with a face).
+    function test(L, pen, caseId, i, j, biasFace) {
+        // bias: for edge-edge axes, add small epsilon so faces win ties
+        const biased = biasFace ? pen : pen - 1e-4;
+        // if (biased > bestPen) {
+        if (biased < bestPen) {
+            bestPen = biased;
+            bestAxis.copy(L);
+            // ensure axis points from A to B
+            if (L.dot(t) < 0) bestAxis.negate();
+            bestCase = caseId;
+            bestI = i; bestJ = j;
+        }
+        // console.log("test", caseId, pen, i, j, bestPen);
+    }
+
+    // Face axes of A
+    for (let i=0;i<3;i++) {
+        const rA = ah[i];
+        const rB = bh[0]*AbsR[i][0] + bh[1]*AbsR[i][1] + bh[2]*AbsR[i][2];
+        const dist = Math.abs(tA.getComponent(i));
+        const pen = rA + rB - dist;
+        if (pen < 0) {
+            // console.log("case A", i);
+            return null;
+        }
+        test(A.axes[i], pen, i, i, 0, true);
+    }
+    // Face axes of B
+    const tB = new THREE.Vector3(t.dot(B.axes[0]), t.dot(B.axes[1]), t.dot(B.axes[2]));
+    for (let j=0;j<3;j++) {
+        const rA = ah[0]*AbsR[0][j] + ah[1]*AbsR[1][j] + ah[2]*AbsR[2][j];
+        const rB = bh[j];
+        const dist = Math.abs(tB.getComponent(j));
+        const pen = rA + rB - dist;
+        if (pen < 0) {
+            // console.log("case B", j);
+            return null;
+        }
+        test(B.axes[j], pen, 3+j, 0, j, true);
+    }
+    // Edge-edge axes (9 cross products)
+    for (let i=0;i<3;i++) {
+        for (let j=0;j<3;j++) {
+            const L = new THREE.Vector3().crossVectors(A.axes[i], B.axes[j]);
+            const len2 = L.lengthSq();
+            if (len2 < 1e-8) continue; // parallel edges, skip
+            L.multiplyScalar(1/Math.sqrt(len2));
+
+            // projection radii using Gottschalk formulation
+            const i1=(i+1)%3, i2=(i+2)%3, j1=(j+1)%3, j2=(j+2)%3;
+            const rA = ah[i1]*AbsR[i2][j] + ah[i2]*AbsR[i1][j];
+            const rB = bh[j1]*AbsR[i][j2] + bh[j2]*AbsR[i][j1];
+            // const dist = Math.abs(t.dot(L));
+            const dist = Math.abs(tA.getComponent(i2)*R[i1][j] - tA.getComponent(i1)*R[i2][j]);
+            const pen = rA + rB - dist;
+            if (pen < 0) {
+                // console.log("case C", i, j, pen);
+                // console.log("case C", i, j, rA, rB, dist);
+                // console.log("case C", t, L);
+                return null;
+            }
+            test(L, pen, 6 + i*3 + j, i, j, false);
+        }
+    }
+
+    if (bestCase < 0) {
+        // console.log("case D");
+        return null;
+    }
+
+    // -------- 2. Generate contact points from the chosen axis --------
+    if (bestCase >= 6) {
+        // Edge–edge contact: single point = closest points between the two edges
+        return edgeEdgeContact(A, B, bestI, bestJ, bestAxis, bestPen);
+    } else {
+        // Face contact: clip the incident face against the reference face's side planes
+        const refIsA = bestCase < 3;
+        return faceContact(A, B, bestAxis, bestPen, refIsA);
+    }
+}
+
+// ======================================================================
+//  Edge–edge: closest points on two line segments
+// ======================================================================
+function edgeEdgeContact(A, B, iA, iB, normal, depth) {
+    // Find the edge of A that is "most in the direction of +normal"
+    // (i.e. the edge whose midpoint is furthest along +normal from A's center)
+    const edgeA = supportEdge(A, iA, normal);
+    const edgeB = supportEdge(B, iB, normal.clone().negate());
+
+    const p = closestPointsOnSegments(edgeA[0], edgeA[1], edgeB[0], edgeB[1]);
+    // console.log("edge-edge N", normal, iA, iB);
+    // console.log("edge-edge eA", edgeA[0], edgeA[1]);
+    // console.log("edge-edge eB", edgeB[0], edgeB[1]);
+    // console.log("edge-edge A", p.a);
+    // console.log("edge-edge B", p.b);
+    const contact = new THREE.Vector3().addVectors(p.a, p.b).multiplyScalar(0.5);
+
+    return {
+        normal: normal.clone(),
+        points: [{ position: contact, depth: depth }],
+        edges: {                          // <-- new
+               A: [edgeA[0], edgeA[1]],      //    blue
+               B: [edgeB[0], edgeB[1]],      //    green
+        },
+        featureType: 'edge-edge'
+    };
+}
+
+// Return the edge (two endpoints) parallel to box.axes[axisIdx] that is
+// furthest along direction 'dir'.
+function supportEdge(box, axisIdx, dir) {
+    const i1 = (axisIdx+1)%3, i2 = (axisIdx+2)%3;
+    const s1 = Math.sign(box.axes[i1].dot(dir)) || 1;
+    const s2 = Math.sign(box.axes[i2].dot(dir)) || 1;
+    const h = [box.h.x, box.h.y, box.h.z];
+    const base = new THREE.Vector3().copy(box.c)
+        .addScaledVector(box.axes[i1], s1 * h[i1])
+        .addScaledVector(box.axes[i2], s2 * h[i2]);
+    const p0 = base.clone().addScaledVector(box.axes[axisIdx], -h[axisIdx]);
+    const p1 = base.clone().addScaledVector(box.axes[axisIdx],  h[axisIdx]);
+    return [p0, p1];
+}
+
+function closestPointsOnSegments(p1, p2, p3, p4) {
+    const d1 = new THREE.Vector3().subVectors(p2, p1);
+    const d2 = new THREE.Vector3().subVectors(p4, p3);
+    const r  = new THREE.Vector3().subVectors(p1, p3);
+    const a = d1.dot(d1), e = d2.dot(d2), f = d2.dot(r);
+    let s, t;
+    if (a <= EPS && e <= EPS) return { a: p1.clone(), b: p3.clone() };
+    if (a <= EPS) { s = 0; t = THREE.MathUtils.clamp(f/e, 0, 1); }
+    else {
+        const c = d1.dot(r);
+        if (e <= EPS) { t = 0; s = THREE.MathUtils.clamp(-c/a, 0, 1); }
+        else {
+            const b = d1.dot(d2);
+            const denom = a*e - b*b;
+            s = denom !== 0 ? THREE.MathUtils.clamp((b*f - c*e)/denom, 0, 1) : 0;
+            t = (b*s + f)/e;
+            if (t < 0) { t = 0; s = THREE.MathUtils.clamp(-c/a, 0, 1); }
+            else if (t > 1) { t = 1; s = THREE.MathUtils.clamp((b-c)/a, 0, 1); }
+        }
+    }
+    return {
+        a: p1.clone().addScaledVector(d1, s),
+        b: p3.clone().addScaledVector(d2, t)
+    };
+}
+
+// ======================================================================
+//  Face contact: Sutherland–Hodgman clipping
+// ======================================================================
+function faceContact(A, B, normal, depth, refIsA) {
+    // Reference box = the one whose face normal is 'normal'
+    // Incident box  = the other; pick its face most anti-parallel to normal
+    const ref = refIsA ? A : B;
+    const inc = refIsA ? B : A;
+    const refNormal = normal.clone();               // points A -> B
+    if (!refIsA) refNormal.negate();                 // make it point OUT of ref
+
+    // --- Reference face: pick face of 'ref' whose outward normal == refNormal ---
+    const refFace = getSupportFace(ref,  refNormal);
+    // --- Incident face: pick face of 'inc' whose outward normal is most opposite refNormal ---
+    const incFace = getSupportFace(inc, refNormal.clone().negate());
+
+    // Clip incident polygon against the 4 side planes of the reference face
+    let poly = incFace.vertices;
+    for (const plane of refFace.sidePlanes) {
+        poly = clipPolygonAgainstPlane(poly, plane.normal, plane.offset);
+        if (poly.length === 0) break;
+    }
+
+    // Keep only points that are below the reference face plane (i.e. penetrating)
+    const refPlaneN = refFace.normal;
+    const refPlaneD = refFace.normal.dot(refFace.vertices[0]);
+    const contacts = [];
+    for (const p of poly) {
+        const d = refPlaneN.dot(p) - refPlaneD; // positive = outside ref face
+        if (d <= EPS) {
+            // Project contact point onto the reference face for numerical stability
+            const projected = p.clone().addScaledVector(refPlaneN, -d);
+            contacts.push({ position: projected, depth: -d });
+        }
+    }
+
+    if (contacts.length === 0) {
+        // console.log("case E: no contact points after clipping", refNormal, refPlaneN, refPlaneD, poly);
+        return null;
+    }
+
+    // Reduce to at most 4 points (box-box face contacts never need more)
+    const reduced = reduceManifold(contacts, normal);
+
+    return {
+        normal: normal.clone(),
+        points: reduced,
+        featureType: refIsA ? 'face-A' : 'face-B'
+    };
+}
+
+// Return the face of a box whose outward normal is most aligned with 'dir'.
+// Returns { normal, vertices[4], sidePlanes[4] } where sidePlanes point OUTWARD
+// from the face (so "inside" is plane.normal . x <= plane.offset).
+function getSupportFace(box, dir) {
+    // Choose which axis of the box is most aligned
+    let bestAxis = 0, bestDot = -Infinity, bestSign = 1;
+    for (let i=0;i<3;i++) {
+        const d = box.axes[i].dot(dir);
+        if (Math.abs(d) > bestDot) {
+
+
+
+            bestDot = Math.abs(d);
+            bestAxis = i;
+            bestSign = d >= 0 ? 1 : -1;
+        }
+    }
+    const a  = bestAxis;
+    const u  = (a+1)%3;
+    const v  = (a+2)%3;
+    const h  = [box.h.x, box.h.y, box.h.z];
+    const n  = box.axes[a].clone().multiplyScalar(bestSign);
+
+    // Face center
+    const fc = box.c.clone().addScaledVector(box.axes[a], bestSign * h[a]);
+
+    // Four face vertices (CCW when viewed from outside along -n)
+    const eu = box.axes[u].clone().multiplyScalar(h[u]);
+    const ev = box.axes[v].clone().multiplyScalar(h[v]);
+    const verts = [
+        fc.clone().sub(eu).sub(ev),
+        fc.clone().add(eu).sub(ev),
+        fc.clone().add(eu).add(ev),
+        fc.clone().sub(eu).add(ev),
+    ];
+
+    // Four side planes: outward normals ±axes[u], ±axes[v]
+    const sidePlanes = [
+        { normal: box.axes[u].clone(),                 offset:  box.axes[u].dot(fc) + h[u] },
+        { normal: box.axes[u].clone().negate(),        offset: -box.axes[u].dot(fc) + h[u] },
+        { normal: box.axes[v].clone(),                 offset:  box.axes[v].dot(fc) + h[v] },
+        { normal: box.axes[v].clone().negate(),        offset: -box.axes[v].dot(fc) + h[v] },
+    ];
+
+    return { normal: n, vertices: verts, sidePlanes };
+}
+
+// Clip a convex polygon against the half-space: n·x <= offset (keep inside).
+function clipPolygonAgainstPlane(poly, n, offset) {
+    const out = [];
+    if (poly.length === 0) return out;
+    let prev = poly[poly.length - 1];
+    let prevD = n.dot(prev) - offset;
+    for (const curr of poly) {
+        const currD = n.dot(curr) - offset;
+        if (currD <= 0) {
+            if (prevD > 0) {
+                // entering: add intersection
+                const t = prevD / (prevD - currD);
+                out.push(new THREE.Vector3().lerpVectors(prev, curr, t));
+            }
+            out.push(curr.clone());
+        } else if (prevD <= 0) {
+            // leaving: add intersection only
+            const t = prevD / (prevD - currD);
+            out.push(new THREE.Vector3().lerpVectors(prev, curr, t));
+        }
+        prev = curr;
+        prevD = currD;
+    }
+    return out;
+}
+
+// Reduce a set of contact points to at most 4, keeping the ones that
+// maximize manifold area (standard physics-engine heuristic).
+function reduceManifold(contacts, normal) {
+    if (contacts.length <= 4) return contacts;
+
+    // 1) Deepest point
+    let p0 = contacts[0];
+    for (const c of contacts) if (c.depth > p0.depth) p0 = c;
+
+    // 2) Farthest from p0
+    let p1 = contacts[0], d1 = -1;
+    for (const c of contacts) {
+        const d = c.position.distanceToSquared(p0.position);
+        if (d > d1) { d1 = d; p1 = c; }
+    }
+
+    // 3) Point maximizing triangle area with (p0, p1)
+    const edge = new THREE.Vector3().subVectors(p1.position, p0.position);
+    let p2 = null, bestArea = 0;
+    for (const c of contacts) {
+        if (c === p0 || c === p1) continue;
+        const v = new THREE.Vector3().subVectors(c.position, p0.position);
+        const area = new THREE.Vector3().crossVectors(edge, v).dot(normal);
+        if (Math.abs(area) > Math.abs(bestArea)) { bestArea = area; p2 = c; }
+    }
+    if (!p2) return [p0, p1];
+
+    // 4) Point maximizing |signed area| with opposite sign from p2 relative to each edge
+    //    (i.e. the point that "best fills" the quad on the other side of p0-p1)
+    let p3 = null, bestOpp = 0;
+    const tris = [[p0,p1],[p1,p2],[p2,p0]];
+    for (const c of contacts) {
+        if (c === p0 || c === p1 || c === p2) continue;
+        for (const [a,b] of tris) {
+            const e = new THREE.Vector3().subVectors(b.position, a.position);
+            const v = new THREE.Vector3().subVectors(c.position, a.position);
+            const area = new THREE.Vector3().crossVectors(e, v).dot(normal);
+            // we want area of *opposite* sign to what p2 gave
+            if (-Math.sign(bestArea) * area > bestOpp) { bestOpp = -Math.sign(bestArea)*area; p3 = c; }
+        }
+    }
+
+    return p3 ? [p0,p1,p2,p3] : [p0,p1,p2];
+}
+
+// ======================================================================
+//  DEMO / VISUALISATION
+// ======================================================================
+const scene    = new THREE.Scene();
+const camera   = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 100);
+camera.position.set(6, 5, 7);
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+const dl = new THREE.DirectionalLight(0xffffff, 0.8);
+dl.position.set(5,10,7); scene.add(dl);
+scene.add(new THREE.GridHelper(10, 10, 0x444444, 0x222222));
+
+// --- Two boxes -------------------------------------------------------------
+function makeBoxMesh(sx, sy, sz, color) {
+    const g = new THREE.BoxGeometry(sx, sy, sz);
+    const m = new THREE.MeshPhongMaterial({ color, transparent:true, opacity:0.55 });
+    const mesh = new THREE.Mesh(g, m);
+    const edges = new THREE.LineSegments(
+        new THREE.EdgesGeometry(g),
+        new THREE.LineBasicMaterial({ color:0xffffff }));
+    mesh.add(edges);
+    scene.add(mesh);
+    mesh.userData.halfExtents = new THREE.Vector3(sx/2, sy/2, sz/2);
+    return mesh;
+}
+const meshA = makeBoxMesh(2, 2, 2, 0x4488ff);
+const meshB = makeBoxMesh(1.6, 2.4, 1.2, 0xff8844);
+meshA.position.set(0,0,0);
+meshB.position.set(1.4, 1.1, 0.5);
+meshB.rotation.set(0.4, 0.7, 0.3);
+
+// --- Debug visuals ---------------------------------------------------------
+const contactGroup = new THREE.Group();
+scene.add(contactGroup);
+
+function clearGroup(g) { while (g.children.length) g.remove(g.children[0]); }
+
+function drawContact(manifold) {
+    clearGroup(contactGroup);
+    if (!manifold) return;
+    // Normal arrow (from manifold centroid, A -> B)
+    const centroid = new THREE.Vector3();
+    manifold.points.forEach(p => centroid.add(p.position));
+    centroid.divideScalar(manifold.points.length);
+    const arrow = new THREE.ArrowHelper(manifold.normal, centroid, 1.5, 0xffff00, 0.25, 0.15);
+    contactGroup.add(arrow);
+
+    // Contact points
+    const sphGeo = new THREE.SphereGeometry(0.08, 12, 12);
+    const sphMat = new THREE.MeshBasicMaterial({ color:0xff0000 });
+    for (const p of manifold.points) {
+        const s = new THREE.Mesh(sphGeo, sphMat);
+        s.position.copy(p.position);
+        contactGroup.add(s);
+        // depth line along -normal
+        const end = p.position.clone().addScaledVector(manifold.normal, -p.depth);
+        const lg = new THREE.BufferGeometry().setFromPoints([p.position, end]);
+        contactGroup.add(new THREE.Line(lg, new THREE.LineBasicMaterial({ color:0x00ff00 })));
+    }
+
+    if (manifold.edges) {
+       const drawEdge = (pts, color) => {
+           const lg = new THREE.BufferGeometry().setFromPoints(pts);
+           contactGroup.add(new THREE.Line(lg, new THREE.LineBasicMaterial({ color, linewidth: 3 })));
+       };
+       drawEdge(manifold.edges.A, 0xff8844); // blue
+       drawEdge(manifold.edges.B, 0x44ff44); // green
+    }
+
+    // Manifold polygon (if >=3 points)
+    if (manifold.points.length >= 3) {
+        const pts = manifold.points.map(p=>p.position);
+        pts.push(pts[0]);
+        const lg = new THREE.BufferGeometry().setFromPoints(pts);
+        contactGroup.add(new THREE.Line(lg, new THREE.LineBasicMaterial({ color:0xff00ff })));
+    }
+}
+
+// --- Simple keyboard interaction: move/rotate box B ------------------------
+const keys = {};
+addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+addEventListener('keyup',   e => keys[e.key.toLowerCase()] = false);
+const info = document.getElementById('info');
+info.innerHTML = `
+Box-Box Contact Manifold (SAT + Sutherland-Hodgman)<br>
+Move box B:  [W/S] z  &nbsp; [A/D] x  &nbsp; [Q/E] y<br>
+Rotate box B: [I/K] pitch  &nbsp; [J/L] yaw  &nbsp; [U/O] roll<br>
+<span id="stat"></span>`;
+const stat = document.getElementById('stat');
+
+function update(dt) {
+    const mv = 2.0 * dt, rv = 1.5 * dt;
+    if (keys['a']) meshB.position.x -= mv;
+    if (keys['d']) meshB.position.x += mv;
+    if (keys['q']) meshB.position.y -= mv;
+    if (keys['e']) meshB.position.y += mv;
+    if (keys['w']) meshB.position.z -= mv;
+    if (keys['s']) meshB.position.z += mv;
+    if (keys['i']) meshB.rotateX(-rv);
+    if (keys['k']) meshB.rotateX( rv);
+    if (keys['j']) meshB.rotateY(-rv);
+    if (keys['l']) meshB.rotateY( rv);
+    if (keys['u']) meshB.rotateZ(-rv);
+    if (keys['o']) meshB.rotateZ( rv);
+}
+
+function meshToOBB(mesh) {
+    mesh.updateMatrixWorld(true);
+    return new OBB(mesh.position, mesh.userData.halfExtents, mesh.quaternion);
+}
+
+const clock = new THREE.Clock();
+function animate() {
+    const dt = clock.getDelta();
+    update(dt);
+
+    const A = meshToOBB(meshA);
+    const B = meshToOBB(meshB);
+    const manifold = boxBoxManifold(A, B);
+    drawContact(manifold);
+
+    if (manifold) {
+        stat.innerHTML = `<span style="color:#8f8">COLLIDING</span> — ` +
+            `${manifold.featureType}, ${manifold.points.length} pts, ` +
+            `max depth ${Math.max(...manifold.points.map(p=>p.depth)).toFixed(3)}`;
+    } else {
+        stat.innerHTML = `<span style="color:#f88">SEPARATED</span>`;
+    }
+
+    renderer.render(scene, camera);
+    requestAnimationFrame(animate);
+}
+animate();
+
+addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

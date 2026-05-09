@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rigid Body Dynamics Simulator</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{overflow:hidden;background:#000;font-family:'Segoe UI',sans-serif}
+canvas{display:block}
+#ui{position:absolute;top:12px;left:12px;color:#fff;background:rgba(0,0,0,.7);padding:14px 18px;border-radius:8px;pointer-events:none;user-select:none;line-height:1.6;font-size:13px}
+#ui b{color:#ffd700}
+#stats{position:absolute;top:12px;right:12px;color:#fff;background:rgba(0,0,0,.7);padding:10px 14px;border-radius:8px;font-size:12px;font-family:monospace;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="ui">
+<div style="font-size:16px;margin-bottom:6px">&nbsp;&nbsp;Rigid Body Dynamics</div>
+<div><b>Click</b> / <b>Space</b> &rarr; Shoot ball</div>
+<div><b>Right-drag</b> &rarr; Orbit camera</div>
+<div><b>Scroll</b> &rarr; Zoom</div>
+<div><b>R</b> &rarr; Reset scene</div>
+</div>
+<div id="stats"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function(){
+"use strict";
+
+var PI=Math.PI,sqrt=Math.sqrt,min=Math.min,max=Math.max,abs=Math.abs,cos=Math.cos,sin=Math.sin,random=Math.random;
+var EPS=1e-7;
+var dbg={collisions:0,contacts:0};
+
+/* ========== Vec3 ========== */
+function V3(x,y,z){this.x=x||0;this.y=y||0;this.z=z||0}
+V3.prototype.set=function(x,y,z){this.x=x;this.y=y;this.z=z;return this};
+V3.prototype.clone=function(){return new V3(this.x,this.y,this.z)};
+V3.prototype.add=function(v){return new V3(this.x+v.x,this.y+v.y,this.z+v.z)};
+V3.prototype.sub=function(v){return new V3(this.x-v.x,this.y-v.y,this.z-v.z)};
+V3.prototype.mul=function(s){return new V3(this.x*s,this.y*s,this.z*s)};
+V3.prototype.dot=function(v){return this.x*v.x+this.y*v.y+this.z*v.z};
+V3.prototype.cross=function(v){return new V3(this.y*v.z-this.z*v.y,this.z*v.x-this.x*v.z,this.x*v.y-this.y*v.x)};
+V3.prototype.len=function(){return sqrt(this.x*this.x+this.y*this.y+this.z*this.z)};
+V3.prototype.lenSq=function(){return this.x*this.x+this.y*this.y+this.z*this.z};
+V3.prototype.normalize=function(){var l=this.len();if(l>EPS){this.x/=l;this.y/=l;this.z/=l}return this};
+V3.prototype.normalized=function(){var l=this.len();return l>EPS?new V3(this.x/l,this.y/l,this.z/l):new V3()};
+V3.prototype.negate=function(){return new V3(-this.x,-this.y,-this.z)};
+V3.prototype.addScaled=function(v,s){this.x+=v.x*s;this.y+=v.y*s;this.z+=v.z*s;return this};
+
+/* ========== Quat ========== */
+function Q(){this.x=0;this.y=0;this.z=0;this.w=1}
+Q.prototype.multiply=function(q){
+var ax=this.x,ay=this.y,az=this.z,aw=this.w;
+var bx=q.x,by=q.y,bz=q.z,bw=q.w;
+this.x=ax*bw+aw*bx+ay*bz-az*by;
+this.y=ay*bw+aw*by+az*bx-ax*bz;
+this.z=az*bw+aw*bz+ax*by-ay*bx;
+this.w=aw*bw-ax*bx-ay*by-az*bz;return this};
+Q.prototype.normalize=function(){
+var l=sqrt(this.x*this.x+this.y*this.y+this.z*this.z+this.w*this.w);
+if(l>EPS){this.x/=l;this.y/=l;this.z/=l;this.w/=l}return this};
+
+/* rotate vector by quaternion: q * v * q_conjugate */
+function qRot(q,v){
+var x=q.x,y=q.y,z=q.z,w=q.w;
+var vx=v.x,vy=v.y,vz=v.z;
+var tx=2*(y*vz-z*vy),ty=2*(z*vx-x*vz),tz=2*(x*vy-y*vx);
+return new V3(vx+w*tx+(y*tz-z*ty),vy+w*ty+(z*tx-x*tz),vz+w*tz+(x*ty-y*tx))}
+
+/* rotate by conjugate: inverse rotation for unit quaternions */
+function qRotInv(q,v){
+var x=-q.x,y=-q.y,z=-q.z,w=q.w;
+var vx=v.x,vy=v.y,vz=v.z;
+var tx=2*(y*vz-z*vy),ty=2*(z*vx-x*vz),tz=2*(x*vy-y*vx);
+return new V3(vx+w*tx+(y*tz-z*ty),vy+w*ty+(z*tx-x*tz),vz+w*tz+(x*ty-y*tx))}
+
+/* quaternion to 3x3 rotation matrix, column-major layout [9] */
+function qToMat(q){
+var x=q.x,y=q.y,z=q.z,w=q.w;
+return new Float64Array([
+  1-2*(y*y+z*z), 2*(x*y+w*z), 2*(x*z-w*y),
+  2*(x*y-w*z),   1-2*(x*x+z*z), 2*(y*z+w*x),
+  2*(x*z+w*y),   2*(y*z-w*x),   1-2*(x*x+y*y)])}
+
+/* matrix-vector multiply, column-major */
+function matVec(M,v){
+return new V3(M[0]*v.x+M[3]*v.y+M[6]*v.z,
+              M[1]*v.x+M[4]*v.y+M[7]*v.z,
+              M[2]*v.x+M[5]*v.y+M[8]*v.z)}
+
+/* matrix-matrix multiply, column-major */
+function matMul(A,B){
+var o=new Float64Array(9),i,j,k,s;
+for(i=0;i<3;i++)for(j=0;j<3;j++){
+  s=0;for(k=0;k<3;k++)s+=A[i+k*3]*B[k+j*3];o[i+j*3]=s}
+return o}
+
+/* ========== Body ========== */
+function Body(opts){
+this.id=opts.id||0;
+this.type=opts.type||'dynamic';
+this.pos=new V3(opts.x||0,opts.y||0,opts.z||0);
+this.q=new Q();
+this.vel=new V3(opts.vx||0,opts.vy||0,opts.vz||0);
+this.angVel=new V3(opts.angVx||0,opts.angVy||0,opts.angVz||0);
+this.shape=opts.shape||'box';
+this.halfExtents=new V3(opts.hx||0.5,opts.hy||0.5,opts.hz||0.5);
+this.radius=opts.radius||0.5;
+this.mass=opts.mass||1;
+this.invMass=this.type==='static'?0:1/this.mass;
+this.localInvI=new V3();
+this._setupInertia();
+this.restitution=opts.restitution!==undefined?opts.restitution:0.15;
+this.friction=opts.friction!==undefined?opts.friction:0.5;
+this.color=opts.color||0x888888;
+this.sleeping=false;this.sleepTimer=0}
+
+Body.prototype._setupInertia=function(){
+if(this.type==='static')return;
+var m=this.mass,he=this.halfExtents;
+if(this.shape==='box'){
+  var hx=he.x,hy=he.y,hz=he.z;
+  this.localInvI.set(
+    3/(m*(hy*hy+hz*hz)),
+    3/(m*(hx*hx+hz*hz)),
+    3/(m*(hx*hx+hy*hy)))}
+else{
+  var r=this.radius;
+  var Iinv=1/(0.4*m*r*r);
+  this.localInvI.set(Iinv,Iinv,Iinv)}};
+
+/* World inverse inertia matrix = R * diag(localInvI) * R^T */
+Body.prototype.getWorldInvI=function(){
+    /*var R=qToMat(this.q);
+    var li=this.localInvI;
+    var S=new Float64Array(9);
+    S[0]=R[0]*li.x;S[1]=R[1]*li.x;S[2]=R[2]*li.x;
+    S[3]=R[3]*li.y;S[4]=R[4]*li.y;S[5]=R[5]*li.y;
+    S[6]=R[6]*li.z;S[7]=R[7]*li.z;S[8]=R[8]*li.z;
+    return matMul(R,S)*/
+    var R = qToMat(this.q);
+    var li = this.localInvI;
+
+    // diag(localInvI)
+    var D = new Float64Array(9);
+    D[0]=li.x; D[4]=li.y; D[8]=li.z;
+
+    // R * D
+    var RD = matMul(R, D);
+
+    // transpose of R
+    var Rt = new Float64Array([
+        R[0],R[3],R[6],
+        R[1],R[4],R[7],
+        R[2],R[5],R[8]
+    ]);
+
+    // final: R * D * R^T
+    return matMul(RD, Rt);
+};
+
+Body.prototype.worldToLocal=function(p){return qRotInv(this.q,p.sub(this.pos))};
+Body.prototype.localToWorld=function(p){return qRot(this.q,p).add(this.pos)};
+Body.prototype.bodyAngVel=function(){return qRotInv(this.q,this.angVel)};
+
+/* ========== Contact ========== */
+/* ========== Contact ========== */
+function Contact(){
+  this.pos = new V3();
+  this.normal = new V3();
+  this.depth = 0;
+  this.bodyA = null;
+  this.bodyB = null;
+
+  // persistent solver state
+  this.normalImpulse = 0;
+  this.tangentImpulse1 = 0;
+  this.tangentImpulse2 = 0;
+//   this.tangentImpulse = 0;
+
+  this.ra = new V3();
+  this.rb = new V3();
+
+  this.massNormal = 0;
+  this.massTangent = 0;
+
+  this.bias = 0;
+}
+
+function sphereVsSphere(a,b,contacts){
+var diff=b.pos.sub(a.pos);
+var dist=diff.len();
+var sumR=a.radius+b.radius;
+if(dist>sumR||dist<EPS)return false;
+var n=diff.mul(1/dist);
+var c=new Contact();
+c.pos=a.pos.add(n.mul(a.radius));c.normal=n;c.depth=sumR-dist;
+c.bodyA=a;c.bodyB=b;contacts.push(c);return true}
+
+function sphereVsBox(sphere,box,contacts){
+var sphereInBoxSpace=box.worldToLocal(sphere.pos);
+var he=box.halfExtents;
+var closest=new V3(
+  max(-he.x,min(he.x,sphereInBoxSpace.x)),
+  max(-he.y,min(he.y,sphereInBoxSpace.y)),
+  max(-he.z,min(he.z,sphereInBoxSpace.z)));
+var diff=sphereInBoxSpace.sub(closest);
+var distSq=diff.lenSq();
+if(distSq>sphere.radius*sphere.radius)return false;
+var normal,depth;
+if(distSq<EPS){
+  /* sphere center inside box - find minimum penetration face */
+  var gaps=[
+    {axis:new V3(1,0,0),gap:he.x-abs(sphereInBoxSpace.x)},
+    {axis:new V3(0,1,0),gap:he.y-abs(sphereInBoxSpace.y)},
+    {axis:new V3(0,0,1),gap:he.z-abs(sphereInBoxSpace.z)}];
+  gaps.sort(function(a,b){return a.gap-b.gap});
+  var minGap=gaps[0];
+  /* direction: outward from box interior toward nearest face */
+  var dir=sphereInBoxSpace.dot(minGap.axis)>=0?1:-1;
+  var localN=minGap.axis.mul(dir);
+  normal=qRot(box.q,localN);
+  depth=sphere.radius+minGap.gap}
+else{
+  var dist=sqrt(distSq);
+  /* diff goes from box-surface toward sphere-center in box-local space.
+     We want normal from sphere to box, which is OPPOSITE of diff. */
+  var localN=diff.mul(-1/dist);
+  normal=qRot(box.q,localN);
+  depth=sphere.radius-dist}
+var c=new Contact();
+/* contact point: sphere surface in normal direction (from sphere toward box) */
+c.pos=sphere.pos.add(normal.mul(sphere.radius));
+c.normal=normal;c.depth=depth;
+c.bodyA=sphere;c.bodyB=box;contacts.push(c);return true}
+
+function boxVsBox(a,b,contacts){
+var Ra=qToMat(a.q),Rb=qToMat(b.q);
+var dp=b.pos.sub(a.pos);
+
+/* world-space half-extent vectors for each box */
+var aAxes=[
+  new V3(Ra[0]*a.halfExtents.x,Ra[1]*a.halfExtents.x,Ra[2]*a.halfExtents.x),
+  new V3(Ra[3]*a.halfExtents.y,Ra[4]*a.halfExtents.y,Ra[5]*a.halfExtents.y),
+  new V3(Ra[6]*a.halfExtents.z,Ra[7]*a.halfExtents.z,Ra[8]*a.halfExtents.z)];
+var bAxes=[
+  new V3(Rb[0]*b.halfExtents.x,Rb[1]*b.halfExtents.x,Rb[2]*b.halfExtents.x),
+  new V3(Rb[3]*b.halfExtents.y,Rb[4]*b.halfExtents.y,Rb[5]*b.halfExtents.y),
+  new V3(Rb[6]*b.halfExtents.z,Rb[7]*b.halfExtents.z,Rb[8]*b.halfExtents.z)];
+
+/* 15 SAT axes */
+var axes=[],i,j;
+for(i=0;i<3;i++)axes.push(new V3(Ra[i*3],Ra[i*3+1],Ra[i*3+2]).normalize());
+for(i=0;i<3;i++)axes.push(new V3(Rb[i*3],Rb[i*3+1],Rb[i*3+2]).normalize());
+var ax,al;
+for(i=0;i<3;i++){for(j=0;j<3;j++){
+  ax=aAxes[i].cross(bAxes[j]);al=ax.len();
+  if(al>1e-8)axes.push(ax.mul(1/al))}}
+
+var minPen=1e30,separatingAxis=null;
+var pen,rA,rB;
+for(var k=0;k<axes.length;k++){
+  ax=axes[k];rA=0;rB=0;
+  for(i=0;i<3;i++){rA+=abs(aAxes[i].dot(ax));rB+=abs(bAxes[i].dot(ax))}
+  pen=rA+rB-abs(dp.dot(ax));
+  if(pen<0)return false;
+  if(pen<minPen){
+    minPen=pen;
+    /* normal from a to b */
+    var n = ax.clone();
+    if (dp.dot(n) < 0) n = n.negate();
+    separatingAxis = n;}}
+    // separatingAxis=dp.dot(ax)>=0?ax.clone():ax.negate()}}
+if(!separatingAxis)return false;
+
+var c=new Contact();
+/* contact point on the collision surface: midpoint shifted half-penetration toward A */
+c.pos = a.pos.add(b.pos).mul(0.5).add(separatingAxis.negate().mul(minPen*0.5));
+c.normal=separatingAxis;c.depth=minPen;
+c.bodyA=a;c.bodyB=b;contacts.push(c);return true}
+
+function testCollision(a,b,contacts){
+if(a.shape==='sphere'&&b.shape==='sphere')return sphereVsSphere(a,b,contacts);
+if(a.shape==='sphere'&&b.shape==='box')return sphereVsBox(a,b,contacts);
+if(a.shape==='box'&&b.shape==='sphere')return sphereVsBox(b,a,contacts);
+if(a.shape==='box'&&b.shape==='box')return boxVsBox(a,b,contacts);
+return false}
+
+function expandAABB(aabb,vel,dt){
+var dx=abs(vel.x)*dt,dy=abs(vel.y)*dt,dz=abs(vel.z)*dt;
+var lo=aabb.lo.clone(),hi=aabb.hi.clone();
+lo.x-=dx;lo.y-=dy;lo.z-=dz;
+hi.x+=dx;hi.y+=dy;hi.z+=dz;
+return{lo:lo,hi:hi}}
+
+function overlap(a,b){
+return a.lo.x<=b.hi.x&&a.hi.x>=b.lo.x&&a.lo.y<=b.hi.y&&a.hi.y>=b.lo.y&&a.lo.z<=b.hi.z&&a.hi.z>=b.lo.z}
+
+
+/* ========== Physics World ========== */
+var GRAVITY=new V3(0,-9.81,0);
+var SLOP=0.005;
+var SLEEP_THRESHOLD=0.05;
+var SLEEP_TIME=0.5;
+
+function PhysicsWorld(){
+  this.bodies=[];
+  this.contacts=[];
+  this.prevContacts=[];
+  this._nextId=0;
+}
+
+PhysicsWorld.prototype.addBody=function(b){
+  b.id=this._nextId++;
+  this.bodies.push(b);
+  return b;
+};
+
+function matchWarmStart(c, prev){
+  for (var i=0;i<prev.length;i++){
+    var p = prev[i];
+    if (p.bodyA===c.bodyA && p.bodyB===c.bodyB){
+      c.normalImpulse = p.normalImpulse;
+      c.tangentImpulse1 = p.tangentImpulse1 || 0;
+      c.tangentImpulse2 = p.tangentImpulse2 || 0;
+      return;
+    }
+  }
+}
+
+
+function getAABB(body){
+if(body.shape==='sphere'){
+  var r=body.radius,p=body.pos;
+  return{lo:new V3(p.x-r,p.y-r,p.z-r),hi:new V3(p.x+r,p.y+r,p.z+r)}}
+var he=body.halfExtents;
+var lo=new V3(1e9,1e9,1e9),hi=new V3(-1e9,-1e9,-1e9);
+var signs=[-1,1];
+for(var si=0;si<2;si++)for(var sj=0;sj<2;sj++)for(var sk=0;sk<2;sk++){
+  var w=body.localToWorld(new V3(he.x*signs[si],he.y*signs[sj],he.z*signs[sk]));
+  if(w.x<lo.x)lo.x=w.x;if(w.y<lo.y)lo.y=w.y;if(w.z<lo.z)lo.z=w.z;
+  if(w.x>hi.x)hi.x=w.x;if(w.y>hi.y)hi.y=w.y;if(w.z>hi.z)hi.z=w.z}
+return{lo:lo,hi:hi}}
+
+
+PhysicsWorld.prototype.step=function(dt){
+  var subDt = dt/8;
+
+  for (var s=0;s<8;s++){
+    this.integrate(subDt);
+    this.findContacts(subDt);
+
+    this.preStep(subDt);
+    this.warmStart();
+
+    for (var it=0;it<10;it++){
+      for (var i=0;i<this.contacts.length;i++){
+        this.solveContact(this.contacts[i]);
+      }
+    }
+    //fix #3
+    this.positionalCorrection();
+  }
+
+  this.prevContacts = this.contacts.slice();
+  this.updateSleep(dt);
+};
+
+/* ---------- integrate ---------- */
+PhysicsWorld.prototype.integrate=function(dt){
+  for(var i=0;i<this.bodies.length;i++){
+    var b=this.bodies[i];
+    if(b.type==='static'||b.sleeping)continue;
+
+    b.vel.y+=GRAVITY.y*dt;
+
+    b.pos.x+=b.vel.x*dt;
+    b.pos.y+=b.vel.y*dt;
+    b.pos.z+=b.vel.z*dt;
+
+    /* transform world-space angVel to local-space for correct quaternion update */
+    var w=b.bodyAngVel();
+    var speed=w.len();
+
+    if(speed>1e-9){
+      var half=speed*dt*0.5;
+      var s=Math.sin(half)/speed;
+      var dq=new Q();
+      dq.x=w.x*s; dq.y=w.y*s; dq.z=w.z*s; dq.w=Math.cos(half);
+      b.q.multiply(dq).normalize();
+    }
+
+    // b.vel=b.vel.mul(0.998);
+    // b.angVel=b.angVel.mul(0.6);
+    var linearDamping = 0.98;
+    var angularDamping = 0.98;
+
+    b.vel = b.vel.mul(Math.pow(linearDamping, dt * 60));
+    b.angVel = b.angVel.mul(Math.pow(angularDamping, dt * 60));
+  }
+};
+
+PhysicsWorld.prototype.positionalCorrection = function(){
+  var percent = 0.8;
+  var slop = 0.01;
+
+  for (var i=0;i<this.contacts.length;i++){
+    var c = this.contacts[i];
+    var a = c.bodyA, b = c.bodyB;
+
+    var correctionMag = percent * Math.max(c.depth - slop, 0) / (a.invMass + b.invMass);
+    var correction = c.normal.mul(correctionMag);
+
+    if(a.type==='dynamic'){
+      a.pos = a.pos.sub(correction.mul(a.invMass));
+    }
+    if(b.type==='dynamic'){
+      b.pos = b.pos.add(correction.mul(b.invMass));
+    }
+  }
+};
+
+/* ---------- contacts ---------- */
+PhysicsWorld.prototype.findContacts=function(dt){
+  this.contacts=[];
+  var n=this.bodies.length;
+
+  for(var i=0;i<n;i++){
+    var a=this.bodies[i];
+    var aABB=a.type==='dynamic'?expandAABB(getAABB(a),a.vel,dt):getAABB(a);
+
+    for(var j=i+1;j<n;j++){
+      var b=this.bodies[j];
+      if(a.type==='static'&&b.type==='static')continue;
+
+      var bABB=b.type==='dynamic'?expandAABB(getAABB(b),b.vel,dt):getAABB(b);
+      if(!overlap(aABB,bABB))continue;
+
+      var before=this.contacts.length;
+      testCollision(a,b,this.contacts);
+
+      for(var k=before;k<this.contacts.length;k++){
+        matchWarmStart(this.contacts[k],this.prevContacts);
+      }
+    }
+  }
+};
+
+/* ---------- pre step ---------- */
+PhysicsWorld.prototype.preStep=function(dt){
+  var baumgarte=0.1;
+
+  for(var i=0;i<this.contacts.length;i++){
+    var c=this.contacts[i];
+    var a=c.bodyA,b=c.bodyB,n=c.normal;
+
+    c.ra=c.pos.sub(a.pos);
+    c.rb=c.pos.sub(b.pos);
+
+    var rACrossN=c.ra.cross(n);
+    var rBCrossN=c.rb.cross(n);
+
+    var invMass=a.invMass+b.invMass;
+
+    if(a.type==='dynamic'){
+      invMass+=rACrossN.dot(matVec(a.getWorldInvI(),rACrossN));
+    }
+    if(b.type==='dynamic'){
+      invMass+=rBCrossN.dot(matVec(b.getWorldInvI(),rBCrossN));
+    }
+
+    c.massNormal = invMass>0?1/invMass:0;
+
+    /* two orthogonal tangent directions for full friction coverage */
+    var t1 = n.cross(new V3(0,1,0));
+    if(t1.lenSq()<1e-6) t1 = n.cross(new V3(1,0,0));
+    t1 = t1.normalize();
+    var t2 = n.cross(t1).normalize();
+
+    var rACrossT1=c.ra.cross(t1);
+    var rBCrossT1=c.rb.cross(t1);
+    var invMassT1=a.invMass+b.invMass;
+    if(a.type==='dynamic') invMassT1+=rACrossT1.dot(matVec(a.getWorldInvI(),rACrossT1));
+    if(b.type==='dynamic') invMassT1+=rBCrossT1.dot(matVec(b.getWorldInvI(),rBCrossT1));
+    c.massTangent1 = invMassT1>0?1/invMassT1:0;
+
+    c.tangent1 = t1;
+    c.tangent2 = t2;
+
+    var rACrossT2=c.ra.cross(t2);
+    var rBCrossT2=c.rb.cross(t2);
+    var invMassT2=a.invMass+b.invMass;
+    if(a.type==='dynamic') invMassT2+=rACrossT2.dot(matVec(a.getWorldInvI(),rACrossT2));
+    if(b.type==='dynamic') invMassT2+=rBCrossT2.dot(matVec(b.getWorldInvI(),rBCrossT2));
+    c.massTangent2 = invMassT2>0?1/invMassT2:0;
+
+    /* depth is penetration (always >= 0), bias must be POSITIVE so it adds to
+       the normal impulse in the solver: lambda = massNormal * (-vn + bias) */
+    c.bias = baumgarte * Math.max(c.depth - SLOP, 0) / dt;
+  }
+};
+
+/* ---------- warm start ---------- */
+PhysicsWorld.prototype.warmStart=function(){
+  for(var i=0;i<this.contacts.length;i++){
+    var c=this.contacts[i];
+    var a=c.bodyA,b=c.bodyB,n=c.normal;
+
+    var impulse=n.mul(c.normalImpulse);
+
+    if(a.type==='dynamic'){
+      a.vel=a.vel.sub(impulse.mul(a.invMass));
+      a.angVel=a.angVel.sub(matVec(a.getWorldInvI(),c.ra.cross(impulse)));
+    }
+    if(b.type==='dynamic'){
+      b.vel=b.vel.add(impulse.mul(b.invMass));
+      b.angVel=b.angVel.add(matVec(b.getWorldInvI(),c.rb.cross(impulse)));
+    }
+
+    /* warm-start friction on both tangents */
+    if(c.tangentImpulse1||c.tangentImpulse2){
+      var ft1=(c.tangent1||n.cross(new V3(0,1,0))).mul(c.tangentImpulse1);
+      var ft2=(c.tangent2||n.cross(c.tangent1||new V3(1,0,0))).mul(c.tangentImpulse2);
+      if(a.type==='dynamic'){
+        a.vel=a.vel.sub(ft1.mul(a.invMass));
+        a.angVel=a.angVel.sub(matVec(a.getWorldInvI(),c.ra.cross(ft1)));
+        a.vel=a.vel.sub(ft2.mul(a.invMass));
+        a.angVel=a.angVel.sub(matVec(a.getWorldInvI(),c.ra.cross(ft2)));
+      }
+      if(b.type==='dynamic'){
+        b.vel=b.vel.add(ft1.mul(b.invMass));
+        b.angVel=b.angVel.add(matVec(b.getWorldInvI(),c.rb.cross(ft1)));
+        b.vel=b.vel.add(ft2.mul(b.invMass));
+        b.angVel=b.angVel.add(matVec(b.getWorldInvI(),c.rb.cross(ft2)));
+      }
+    }
+  }
+};
+
+/* ---------- solver ---------- */
+PhysicsWorld.prototype.solveContact=function(c){
+  var a=c.bodyA,b=c.bodyB,n=c.normal;
+
+  var velA=a.vel.add(a.angVel.cross(c.ra));
+  var velB=b.vel.add(b.angVel.cross(c.rb));
+  var relVel=velB.sub(velA);
+
+  // normal
+  var vn=relVel.dot(n);
+  var lambda=c.massNormal * (-(vn) + c.bias);
+
+  var old=c.normalImpulse;
+  c.normalImpulse=Math.max(old+lambda,0);
+  lambda=c.normalImpulse-old;
+
+  var impulse=n.mul(lambda);
+
+  if(a.type==='dynamic'){
+    a.vel=a.vel.sub(impulse.mul(a.invMass));
+    a.angVel=a.angVel.sub(matVec(a.getWorldInvI(),c.ra.cross(impulse)));
+  }
+  if(b.type==='dynamic'){
+    b.vel=b.vel.add(impulse.mul(b.invMass));
+    b.angVel=b.angVel.add(matVec(b.getWorldInvI(),c.rb.cross(impulse)));
+  }
+
+  var relSpeed = relVel.len();
+  if (relSpeed < 0.05) {
+  // kill tiny motion → acts like static friction
+    if (a.type === 'dynamic') {
+        a.vel.set(0,0,0);
+        a.angVel.set(0,0,0);
+    }
+    if (b.type === 'dynamic') {
+        b.vel.set(0,0,0);
+        b.angVel.set(0,0,0);
+    }
+    return;
+    }
+
+  // friction on tangent1
+  velA=a.vel.add(a.angVel.cross(c.ra));
+  velB=b.vel.add(b.angVel.cross(c.rb));
+  relVel=velB.sub(velA);
+
+  var vt1=relVel.dot(c.tangent1);
+  var lambdaT1=c.massTangent1*(-vt1);
+
+  var mu=(a.friction+b.friction)*0.5;
+  var maxFriction=mu*c.normalImpulse;
+
+  var oldT1=c.tangentImpulse1||0;
+  c.tangentImpulse1=Math.max(-maxFriction,Math.min(oldT1+lambdaT1,maxFriction));
+  lambdaT1=c.tangentImpulse1-oldT1;
+
+  var ft1=c.tangent1.mul(lambdaT1);
+
+  if(a.type==='dynamic'){
+    a.vel=a.vel.sub(ft1.mul(a.invMass));
+    a.angVel=a.angVel.sub(matVec(a.getWorldInvI(),c.ra.cross(ft1)));
+  }
+  if(b.type==='dynamic'){
+    b.vel=b.vel.add(ft1.mul(b.invMass));
+    b.angVel=b.angVel.add(matVec(b.getWorldInvI(),c.rb.cross(ft1)));
+  }
+
+  // friction on tangent2
+  velA=a.vel.add(a.angVel.cross(c.ra));
+  velB=b.vel.add(b.angVel.cross(c.rb));
+  relVel=velB.sub(velA);
+
+  var vt2=relVel.dot(c.tangent2);
+  var lambdaT2=c.massTangent2*(-vt2);
+
+  var oldT2=c.tangentImpulse2||0;
+  var newT2=Math.max(-maxFriction,Math.min(oldT2+lambdaT2,maxFriction));
+  /* clamp combined friction to cone */
+//   var combined=Math.sqrt((c.tangentImpulse1||0)*(c.tangentImpulse1||0)+newT2*newT2);
+//   if(combined>maxFriction){
+//     newT2*=(maxFriction/combined);
+//     c.tangentImpulse1*=(maxFriction/combined);
+//   }
+  var t1 = c.tangentImpulse1;
+  var t2 = newT2;
+
+    var mag = Math.sqrt(t1*t1 + t2*t2);
+    if (mag > maxFriction) {
+    var scale = maxFriction / mag;
+    t1 *= scale;
+    t2 *= scale;
+    }
+
+c.tangentImpulse1 = t1;
+c.tangentImpulse2 = t2;
+  c.tangentImpulse2=newT2;
+  lambdaT2=c.tangentImpulse2-(oldT2);
+
+  var ft2=c.tangent2.mul(lambdaT2);
+
+  if(a.type==='dynamic'){
+    a.vel=a.vel.sub(ft2.mul(a.invMass));
+    a.angVel=a.angVel.sub(matVec(a.getWorldInvI(),c.ra.cross(ft2)));
+  }
+  if(b.type==='dynamic'){
+    b.vel=b.vel.add(ft2.mul(b.invMass));
+    b.angVel=b.angVel.add(matVec(b.getWorldInvI(),c.rb.cross(ft2)));
+  }
+};
+
+PhysicsWorld.prototype.updateSleep=function(dt){
+var b,velSq;
+for(var i=0;i<this.bodies.length;i++){
+  b=this.bodies[i];
+  if(b.type==='static')continue;
+  velSq=b.vel.lenSq()+b.angVel.lenSq();
+  if(velSq<SLEEP_THRESHOLD*SLEEP_THRESHOLD){
+    b.sleepTimer+=dt;
+    if(b.sleepTimer>SLEEP_TIME)b.sleeping=true
+  }else{
+    b.sleepTimer=0;
+    b.sleeping=false}}};
+
+/* ========== Three.js Setup ========== */
+var scene=new THREE.Scene();
+scene.background=new THREE.Color(0x1a1a2e);
+scene.fog=new THREE.FogExp2(0x1a1a2e,0.012);
+
+var camera=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,0.1,200);
+camera.position.set(15,12,18);
+
+var renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth,innerHeight);
+renderer.setPixelRatio(min(devicePixelRatio,2));
+renderer.shadowMap.enabled=true;
+renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+
+var controls=new THREE.OrbitControls(camera,renderer.domElement);
+controls.enableDamping=true;
+controls.dampingFactor=0.06;
+controls.target.set(0,2,0);
+controls.maxPolarAngle=PI*0.48;
+controls.minDistance=5;controls.maxDistance=60;
+
+scene.add(new THREE.AmbientLight(0x404060,0.8));
+var sun=new THREE.DirectionalLight(0xfff5e0,1.8);
+sun.position.set(12,25,12);sun.castShadow=true;
+sun.shadow.mapSize.set(2048,2048);
+sun.shadow.camera.left=-20;sun.shadow.camera.right=20;
+sun.shadow.camera.top=20;sun.shadow.camera.bottom=-20;
+sun.shadow.camera.near=1;sun.shadow.camera.far=60;sun.shadow.bias=-0.0005;
+scene.add(sun);
+var fill=new THREE.DirectionalLight(0x8888ff,0.3);
+fill.position.set(-8,12,-8);scene.add(fill);
+
+var groundMesh=new THREE.Mesh(
+  new THREE.PlaneGeometry(60,60),
+  new THREE.MeshStandardMaterial({color:0x2a2a3e,roughness:0.9}));
+groundMesh.rotation.x=-PI/2;groundMesh.receiveShadow=true;scene.add(groundMesh);
+scene.add(new THREE.GridHelper(60,30,0x3a3a5e,0x252545));
+
+/* ========== Physics Scene ========== */
+var phys=new PhysicsWorld();
+var meshMap=new Map();
+
+/* ground body */
+phys.addBody(new Body({type:'static',shape:'box',x:0,y:-0.25,z:0,hx:30,hy:0.25,hz:30,color:0x3a3a5e}));
+
+/* walls */
+function addWall(x,y,z,hx,hy,hz){
+var w=new Body({type:'static',shape:'box',x:x,y:y,z:z,hx:hx,hy:hy,hz:hz,color:0x2a2a4e});
+phys.addBody(w);
+var m=createMesh(w);m.material.transparent=true;m.material.opacity=0.15}
+addWall(0,2.5,-12,14,5,0.3);
+addWall(-12,2.5,0,0.3,5,24);
+addWall(12,2.5,0,0.3,5,24);
+
+function createMesh(body){
+var geo;
+if(body.shape==='box'){
+  geo=new THREE.BoxGeometry(body.halfExtents.x*2,body.halfExtents.y*2,body.halfExtents.z*2)
+}else{
+  geo=new THREE.SphereGeometry(body.radius,20,20)}
+var mat=new THREE.MeshStandardMaterial({
+  color:body.color,roughness:body.shape==='sphere'?0.25:0.5,metalness:0.1});
+var mesh=new THREE.Mesh(geo,mat);
+mesh.castShadow=true;mesh.receiveShadow=true;
+scene.add(mesh);meshMap.set(body.id,mesh);return mesh}
+
+function updateVisual(body){
+var m=meshMap.get(body.id);if(!m)return;
+m.position.set(body.pos.x,body.pos.y,body.pos.z);
+m.quaternion.set(body.q.x,body.q.y,body.q.z,body.q.w)}
+
+function removeVisual(body){
+var m=meshMap.get(body.id);
+if(m){scene.remove(m);m.geometry.dispose();m.material.dispose();meshMap.delete(body.id)}}
+
+var PALETTE=[0xe74c3c,0xe67e22,0xf39c12,0x2ecc71,0x1abc9c,0x3498db,0x9b59b6,0xe91e63,0x00bcd4,0xff9800,0x8bc34a,0xff5722,0x673ab7,0x03a9f4,0x4caf50,0xcddc39,0x795548,0x607d8b];
+function rndColor(){return PALETTE[Math.floor(random()*PALETTE.length)]}
+
+var totalCount=1;
+
+function buildScene(){
+var dynamicBodies=phys.bodies.filter(function(b){return b.type!=='static'});
+for(var i=0;i<dynamicBodies.length;i++){removeVisual(dynamicBodies[i]);phys.removeBody(dynamicBodies[i])}
+totalCount=phys.bodies.length;
+
+/* pyramid */
+var size=0.6;
+var layers=8;
+for(var L=0;L<layers&&totalCount<1900;L++){
+  var layerSize=6-L;
+  var y=size*0.5+L*size;
+  var offset=(layerSize-1)*size*0.5;
+  for(var i=0;i<layerSize&&totalCount<1900;i++){
+    for(var j=0;j<layerSize&&totalCount<1900;j++){
+      var b=new Body({
+        shape:'box',
+        x:i*size-offset,y:y,z:j*size-offset,
+        hx:size*0.5,hy:size*0.5,hz:size*0.5,
+        mass:1,restitution:0.08,friction:0.7,color:rndColor()});
+      phys.addBody(b);createMesh(b);totalCount++}}}
+
+/* falling blocks */
+for(var k=0;k<40&&totalCount<2000;k++){
+  var b=new Body({
+    shape:'box',
+    x:(random()-0.5)*6,y:6+random()*4,z:(random()-0.5)*6,
+    hx:0.2+random()*0.25,hy:0.2+random()*0.25,hz:0.2+random()*0.25,
+    mass:0.5+random(),restitution:0.05,friction:0.5,color:rndColor(),
+    angVx:random()*2-1,angVy:random()*2-1,angVz:random()*2-1});
+  phys.addBody(b);createMesh(b);totalCount++}}
+
+buildScene();
+
+/* Shoot */
+function shootBall(){
+if(totalCount>=2000)return;
+var dir=new THREE.Vector3();camera.getWorldDirection(dir);
+var speed=20;
+var b=new Body({
+  shape:'sphere',
+  x:camera.position.x+dir.x*3,y:camera.position.y+dir.y*3,z:camera.position.z+dir.z*3,
+  radius:0.4,
+  vx:dir.x*speed,vy:dir.y*speed,vz:dir.z*speed,
+  mass:5,restitution:0.3,friction:0.5,color:0xffcc00});
+phys.addBody(b);createMesh(b);totalCount++;
+while(totalCount>2000){
+  var old=phys.bodies.find(function(x){return x.type==='dynamic'});
+  if(old){removeVisual(old);phys.removeBody(old);totalCount--}else break}}
+
+renderer.domElement.addEventListener('click',shootBall);
+window.addEventListener('keydown',function(e){
+  if(e.code==='Space'){e.preventDefault();shootBall()}
+  if(e.code==='KeyR')buildScene()});
+var tStart=0;
+renderer.domElement.addEventListener('touchstart',function(){tStart=Date.now()});
+renderer.domElement.addEventListener('touchend',function(){if(Date.now()-tStart<300)shootBall()});
+window.addEventListener('resize',function(){
+  camera.aspect=innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight)});
+
+/* ========== Main Loop ========== */
+var clock=new THREE.Clock();
+var statsEl=document.getElementById('stats');
+var fpsFrames=0,fpsAccum=0,fps=0;
+
+function animate(){
+requestAnimationFrame(animate);
+var dt=min(clock.getDelta(),1/30);
+fpsFrames++;fpsAccum+=dt;
+if(fpsAccum>=0.5){fps=Math.round(fpsFrames/fpsAccum);fpsFrames=0;fpsAccum=0}
+
+phys.step(dt);
+
+for(var i=0;i<phys.bodies.length;i++){
+  var b=phys.bodies[i];
+  if(b.type!=='static')updateVisual(b)}
+
+controls.update();
+renderer.render(scene,camera);
+statsEl.innerHTML='FPS: '+fps+'<br>Bodies: '+phys.bodies.length+'<br>Contacts: '+phys.contacts.length}
+
+animate();
+
+})();
+</script>
+</body>
+</html>

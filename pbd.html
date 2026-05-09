@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Box2D-Style Rigid Body Dynamics</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #111; font-family: sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 12px; left: 12px; color: #ccc;
+    background: rgba(0,0,0,0.6); padding: 10px 14px; border-radius: 8px;
+    font-size: 13px; pointer-events: none; line-height: 1.6;
+  }
+  #hud span { color: #7cf; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <span>Box2D-Style Rigid Body Solver</span><br>
+  <span id="count">0</span> bodies · <span id="fps">0</span> FPS · Click to spawn
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x181825);
+scene.fog = new THREE.FogExp2(0x181825, 0.018);
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(16, 12, 18);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0, 3, 0);
+controls.maxPolarAngle = Math.PI * 0.48;
+scene.add(new THREE.AmbientLight(0x404060, 0.6));
+const dl = new THREE.DirectionalLight(0xffeedd, 2);
+dl.position.set(12, 25, 18);
+dl.castShadow = true;
+dl.shadow.mapSize.set(2048, 2048);
+dl.shadow.camera.left = -25; dl.shadow.camera.right = 25;
+dl.shadow.camera.top = 25; dl.shadow.camera.bottom = -25;
+dl.shadow.camera.near = 1; dl.shadow.camera.far = 80;
+dl.shadow.bias = -0.0005;
+scene.add(dl);
+scene.add(new THREE.HemisphereLight(0x8888ff, 0x444422, 0.4));
+const FLOOR_Y = 0;
+const flMesh = new THREE.Mesh(
+  new THREE.PlaneGeometry(60, 60),
+  new THREE.MeshStandardMaterial({ color: 0x222238, roughness: 0.85, metalness: 0.1 })
+);
+flMesh.rotation.x = -Math.PI / 2;
+flMesh.receiveShadow = true;
+scene.add(flMesh);
+const gridH = new THREE.GridHelper(60, 30, 0x333355, 0x222240);
+gridH.position.set(0, 0.01, 0);
+scene.add(gridH);
+
+const GRAVITY = -20;
+const SUBSTEPS = 10;
+const BAUMGARTE = 0.4;
+const SLOP = 0.02;
+const CONTACT_MAX = 4;
+
+/* ── BODY ──────────────────────────────────────────── */
+class Body {
+  constructor({ x=0, y=0, z=0, w=1, h=1, d=1, mass=1,
+                 restitution=0.4, friction=0.3, isStatic=false, color=0x888888 }) {
+    this.pos = new THREE.Vector3(x, y, z);
+    this.quat = new THREE.Quaternion();
+    this.w = w; this.h = h; this.d = d;
+    this.vx = 0; this.vy = 0; this.vz = 0;
+    this.omega = new THREE.Vector3();
+    this.mass = mass;
+    this.invMass = isStatic ? 0 : 1 / mass;
+    this.restitution = restitution;
+    this.friction = friction;
+    this.isStatic = isStatic;
+    const { w:ww, h:hh, d:dd } = this;
+    if (!isStatic) {
+      this.invIX = 1 / (mass / 12 * (hh*hh + dd*dd));
+      this.invIY = 1 / (mass / 12 * (ww*ww + dd*dd));
+      this.invIZ = 1 / (mass / 12 * (ww*ww + hh*hh));
+    } else {
+      this.invIX = this.invIY = this.invIZ = 0;
+    }
+    this.mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(w, h, d),
+      new THREE.MeshStandardMaterial({ color, roughness: 0.4, metalness: 0.15 })
+    );
+    this.mesh.castShadow = true;
+    this.mesh.receiveShadow = true;
+    scene.add(this.mesh);
+  }
+
+  /** 8 world-space vertices of the box */
+  vertices() {
+    const hw = this.w / 2, hh = this.h / 2, hd = this.d / 2;
+    const q = this.quat;
+    const verts = [];
+    for (let sx = -1; sx <= 1; sx += 2)
+    for (let sy = -1; sy <= 1; sy += 2)
+    for (let sz = -1; sz <= 1; sz += 2) {
+      const v = new THREE.Vector3(sx * hw, sy * hh, sz * hd).applyQuaternion(q);
+      v.add(this.pos);
+      verts.push(v);
+    }
+    return verts;
+  }
+
+  /** World-space AABB with rotated axes */
+  aabb() {
+    const hw = this.w / 2, hh = this.h / 2, hd = this.d / 2;
+    const q = this.quat;
+    const dirs = [
+      new THREE.Vector3(1,0,0), new THREE.Vector3(0,1,0), new THREE.Vector3(0,0,1)
+    ].map(a => a.clone().applyQuaternion(q));
+    const exts = [hw, hh, hd];
+    const center = this.pos;
+    let minX=1e9, maxX=-1e9, minY=1e9, maxY=-1e9, minZ=1e9, maxZ=-1e9;
+    for (let sx=-1; sx<=1; sx+=2)
+    for (let sy=-1; sy<=1; sy+=2)
+    for (let sz=-1; sz<=1; sz+=2) {
+      const v = new THREE.Vector3(
+        sx*dirs[0].x*hw + sy*dirs[1].x*hh + sz*dirs[2].x*hd + center.x,
+        sx*dirs[0].y*hw + sy*dirs[1].y*hh + sz*dirs[2].y*hd + center.y,
+        sx*dirs[0].z*hw + sy*dirs[1].z*hh + sz*dirs[2].z*hd + center.z
+      );
+      if(v.x<minX) minX=v.x; if(v.x>maxX) maxX=v.x;
+      if(v.y<minY) minY=v.y; if(v.y>maxY) maxY=v.y;
+      if(v.z<minZ) minZ=v.z; if(v.z>maxZ) maxZ=v.z;
+    }
+    return { minX, maxX, minY, maxY, minZ, maxZ, dirs, exts, center };
+  }
+}
+
+/* ── BODIES ────────────────────────────────────────── */
+const bodies = [];
+const palette = [
+  0xe06070,0xe0a040,0x50b060,0x5090e0,0xc070d0,
+  0x50d0d0,0xe07050,0x9080c0,0x60c080,0xd0a050,
+  0x80b060,0xd06090,0x6070d0,0xd0b060,0x70a0b0,
+  0xb070a0,0x60d0a0,0xa060d0,0xd08060,0x70c070,
+  0xb06080,0x80c0c0,0xc09050,0x6080b0,0xa090a0,
+  0x90a060,0xc06080,0x60a0c0,0xa0c060,0x80c090
+];
+
+bodies.push(new Body({ x:0, y:-0.5, z:0, w:60, h:1, d:60, isStatic:true, color:0x222238 }));
+bodies[0].mesh.visible = false;
+
+const WD=16, WH=30;
+[[-WD,WH/2,0,0.4,WH,WD*2],[WD,WH/2,0,0.4,WH,WD*2],
+ [0,WH/2,-WD,WD*2,WH,0.4],[0,WH/2,WD,WD*2,WH,0.4]
+].forEach(([x,y,z,w,h,d])=>{
+  const b=new Body({x,y,z,w,h,d,isStatic:true,color:0x222238});
+  b.mesh.visible=false; bodies.push(b);
+});
+
+function spawnBlock(x, y, z, size) {
+  const b = new Body({
+    x,y,z, w:size,h:size,d:size, mass:size*size*size,
+    restitution:0.05+Math.random()*0.1,
+    friction:0.3+Math.random()*0.2,
+    color: palette[bodies.length%palette.length]
+  });
+  b.omega.set((Math.random()-.5)*3,(Math.random()-.5)*3,(Math.random()-.5)*3);
+  bodies.push(b);
+}
+
+let idx=0;
+for (const n of [6,5,5,4,4,3,2,2,1,1])
+  for (let i=0;i<n&&idx<30;i++,idx++)
+    spawnBlock((Math.random()-.5)*6, 4+idx*1.4, (Math.random()-.5)*3, 0.5+Math.random()*0.6);
+
+/* ── SAT OBB vs OBB ──────────────────────────────── */
+function satOBB(a, b) {
+  const A = a.aabb(), B = b.aabb();
+  const rel = B.center.clone().sub(A.center);
+  const axes = [...A.dirs, ...B.dirs];
+  for (let i=0;i<3;i++) for (let j=0;j<3;j++) {
+    const c = A.dirs[i].clone().cross(B.dirs[j]);
+    if (c.lengthSq()>1e-8) { c.normalize(); axes.push(c); }
+  }
+  let minD=1e9, minA=null;
+  for (const ax of axes) {
+    const t = rel.dot(ax);
+    let ra=0, rb=0;
+    for (let i=0;i<3;i++) {
+      ra += Math.abs(A.dirs[i].dot(ax))*A.exts[i];
+      rb += Math.abs(B.dirs[i].dot(ax))*B.exts[i];
+    }
+    const overlap = ra+rb-Math.abs(t);
+    if (overlap < -1e-6) return null;
+    if (overlap < minD) {
+      minD = overlap;
+      minA = t < 0 ? ax.clone().negate() : ax.clone();
+    }
+  }
+  if (!minA || minD < -1e-6) return null;
+  return { normal: minA, depth: minD };
+}
+
+/* ── CONTACT MANIFOLD GENERATION ──────────────────── */
+
+/**
+ * Clip a set of points to a half-space defined by a plane.
+ * Plane: point on plane + normal. Keep points where dot(v - planePt, normal) <= 0.
+ * Returns clipped points (up to CONTACT_MAX).
+ */
+function clipPointsToPlane(points, planePt, planeN) {
+  const result = [];
+  const len = points.length;
+  const dists = points.map(p => p.clone().sub(planePt).dot(planeN));
+  for (let i = 0; i < len && result.length < CONTACT_MAX; i++) {
+    if (dists[i] <= 0) {
+      result.push(points[i]);
+    }
+  }
+  // If we clipped, interpolate edges
+  if (result.length < CONTACT_MAX && result.length > 0) {
+    for (let i = 0; i < len; i++) {
+      const j = (i + 1) % len;
+      if (dists[i] * dists[j] < 0) { // edge crosses plane
+        const t = dists[i] / (dists[i] - dists[j]);
+        const pt = points[i].clone().lerp(points[j], t);
+        if (result.length < CONTACT_MAX) result.push(pt);
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Generate contact manifold for body A resting on a flat surface (floor or large body).
+ * Uses bottom vertices of A clipped against the surface plane.
+ */
+function generateFloorManifold(a, surfaceY, normal) {
+  const verts = a.vertices();
+  // Sort vertices by Y, take bottom ones
+  verts.sort((a2, b2) => a2.y - b2.y);
+  const contacts = [];
+  for (const v of verts) {
+    if (v.y < surfaceY + 0.01) {
+      const cp = new THREE.Vector3(v.x, surfaceY, v.z);
+      contacts.push(cp);
+    }
+    if (contacts.length >= CONTACT_MAX) break;
+  }
+  return contacts;
+}
+
+/**
+ * Generate contact manifold for two bodies using clipping.
+ * Find reference face on A, incident face on B, clip incident to reference.
+ */
+function generateManifold(a, b, satResult) {
+  const n = satResult.normal; // points a -> b
+  const vertsA = a.vertices();
+  const vertsB = b.vertices();
+
+  // Find which face of A is most aligned with -normal (reference face)
+  const A = a.aabb();
+  let refDot = -1e9, refFace = null;
+  for (let i = 0; i < 3; i++) {
+    const d1 = A.dirs[i].dot(n);
+    const d2 = -(A.dirs[i].dot(n));
+    if (d1 > refDot) { refDot = d1; refFace = { dir: A.dirs[i].clone(), sign: 1 }; }
+    if (d2 > refDot) { refDot = d2; refFace = { dir: A.dirs[i].clone(), sign: -1 }; }
+  }
+
+  // Reference plane: through center of A, normal = refFace.dir * sign
+  const refPlaneN = refFace.dir.clone().multiplyScalar(refFace.sign);
+  const refPlanePt = A.center.clone();
+
+  // Clip B vertices to reference plane
+  let clipped = clipPointsToPlane(vertsB, refPlanePt, refPlaneN);
+  if (clipped.length < 2) {
+    // Try the other direction
+    const refPlaneN2 = refFace.dir.clone().multiplyScalar(-refFace.sign);
+    clipped = clipPointsToPlane(vertsB, refPlanePt, refPlaneN2);
+  }
+
+  // Also clip to secondary axes of A for tighter manifold
+  for (let i = 0; i < 3 && clipped.length < CONTACT_MAX; i++) {
+    const ax = A.dirs[i];
+    if (Math.abs(ax.dot(refPlaneN)) < 0.1) {
+      // This axis is roughly in the face plane, use it for clipping
+      const planePt = A.center.clone().add(ax.clone().multiplyScalar(A.exts[i]));
+      const clipped2 = clipPointsToPlane(clipped, planePt, ax.clone().negate());
+      if (clipped2.length >= 2) clipped = clipped2;
+    }
+  }
+
+  if (clipped.length < 2) {
+    // Fallback: use vertices of B that penetrate A
+    const penetrating = vertsB.filter(v => pointInOBB(v, A));
+    clipped = penetrating.slice(0, CONTACT_MAX);
+  }
+
+  if (clipped.length < 2) {
+    // Last fallback: use vertices of A near the contact
+    const penetrating = vertsA.filter(v => pointInOBB(v, b.aabb()));
+    clipped = penetrating.slice(0, CONTACT_MAX);
+  }
+
+  if (clipped.length === 0) {
+    // Ultimate fallback: midpoint
+    const mid = A.center.clone().add(n.clone().multiplyScalar(satResult.depth * 0.5));
+    clipped.push(mid);
+  }
+
+  // Average depth for positional correction
+  const avgContact = clipped.reduce((s, v) => s.add(v), new THREE.Vector3()).divideScalar(clipped.length);
+  return { contacts: clipped, normal: n, avgContact };
+}
+
+/** Check if a point is inside an OBB */
+function pointInOBB(pt, box) {
+  const rel = pt.clone().sub(box.center);
+  for (let i = 0; i < 3; i++) {
+    if (Math.abs(rel.dot(box.dirs[i])) > box.exts[i] + 0.01) return false;
+  }
+  return true;
+}
+
+/* ── RESOLVE SINGLE CONTACT POINT ─────────────────── */
+function resolveContact(a, b, contactPt, normal, depth) {
+  const n = normal;
+  const c = contactPt;
+
+  // Positional correction (Baumgarte)
+  const corrMag = Math.max(depth - SLOP, 0) / (a.invMass + b.invMass) * BAUMGARTE;
+  const cp = n.clone().multiplyScalar(corrMag);
+  if (a.invMass) a.pos.sub(cp.clone().multiplyScalar(a.invMass));
+  if (b.invMass) b.pos.add(cp.clone().multiplyScalar(b.invMass));
+
+  const rA = c.clone().sub(a.pos);
+  const rB = c.clone().sub(b.pos);
+
+  const va = new THREE.Vector3(
+    a.vx + a.omega.y*rA.z - a.omega.z*rA.y,
+    a.vy + a.omega.z*rA.x - a.omega.x*rA.z,
+    a.vz + a.omega.x*rA.y - a.omega.y*rA.x
+  );
+  const vb = new THREE.Vector3(
+    b.vx + b.omega.y*rB.z - b.omega.z*rB.y,
+    b.vy + b.omega.z*rB.x - b.omega.x*rB.z,
+    b.vz + b.omega.x*rB.y - b.omega.y*rB.x
+  );
+  const relV = vb.clone().sub(va);
+  const vn = relV.dot(n);
+  if (vn > 0) return;
+
+  const rAxN = rA.clone().cross(n);
+  const rBxN = rB.clone().cross(n);
+  const invMA = a.invMass + rAxN.x*a.invIX*rAxN.x + rAxN.y*a.invIY*rAxN.y + rAxN.z*a.invIZ*rAxN.z;
+  const invMB = b.invMass + rBxN.x*b.invIX*rBxN.x + rBxN.y*b.invIY*rBxN.y + rBxN.z*b.invIZ*rBxN.z;
+  const invME = invMA + invMB;
+  if (invME < 1e-10) return;
+
+  const e = Math.min(a.restitution, b.restitution);
+  const jn = -(1+e)*vn / invME;
+  if (jn <= 0) return;
+
+  const impX = jn*n.x, impY = jn*n.y, impZ = jn*n.z;
+  if (a.invMass) {
+    a.vx -= impX*a.invMass; a.vy -= impY*a.invMass; a.vz -= impZ*a.invMass;
+    const tau = rA.clone().cross(new THREE.Vector3(impX, impY, impZ));
+    a.omega.x -= tau.x*a.invIX; a.omega.y -= tau.y*a.invIY; a.omega.z -= tau.z*a.invIZ;
+  }
+  if (b.invMass) {
+    b.vx += impX*b.invMass; b.vy += impY*b.invMass; b.vz += impZ*b.invMass;
+    const tau = rB.clone().cross(new THREE.Vector3(impX, impY, impZ));
+    b.omega.x += tau.x*b.invIX; b.omega.y += tau.y*b.invIY; b.omega.z += tau.z*b.invIZ;
+  }
+
+  // Friction
+  const va2 = new THREE.Vector3(
+    a.vx+a.omega.y*rA.z-a.omega.z*rA.y, a.vy+a.omega.z*rA.x-a.omega.x*rA.z, a.vz+a.omega.x*rA.y-a.omega.y*rA.x
+  );
+  const vb2 = new THREE.Vector3(
+    b.vx+b.omega.y*rB.z-b.omega.z*rB.y, b.vy+b.omega.z*rB.x-b.omega.x*rB.z, b.vz+b.omega.x*rB.y-b.omega.y*rB.x
+  );
+  const relV2 = vb2.clone().sub(va2);
+  let tan = relV2.clone().sub(n.clone().multiplyScalar(relV2.dot(n)));
+  const tl = tan.length();
+  if (tl < 1e-6) return;
+  tan.normalize();
+
+  const rAxT = rA.clone().cross(tan);
+  const rBxT = rB.clone().cross(tan);
+  const invMA2 = a.invMass+rAxT.x*a.invIX*rAxT.x+rAxT.y*a.invIY*rAxT.y+rAxT.z*a.invIZ*rAxT.z;
+  const invMB2 = b.invMass+rBxT.x*b.invIX*rBxT.x+rBxT.y*b.invIY*rBxT.y+rBxT.z*b.invIZ*rBxT.z;
+  const invME2 = invMA2+invMB2;
+  if (invME2 < 1e-10) return;
+
+  let jt = -relV2.dot(tan)/invME2;
+  const mu = (a.friction+b.friction)/2;
+  if (jt > jn*mu) jt = jn*mu; else if (jt < -jn*mu) jt = -jn*mu;
+
+  const fX = jt*tan.x, fY = jt*tan.y, fZ = jt*tan.z;
+  if (a.invMass) {
+    a.vx -= fX*a.invMass; a.vy -= fY*a.invMass; a.vz -= fZ*a.invMass;
+    const tau = rA.clone().cross(new THREE.Vector3(fX,fY,fZ));
+    a.omega.x -= tau.x*a.invIX; a.omega.y -= tau.y*a.invIY; a.omega.z -= tau.z*a.invIZ;
+  }
+  if (b.invMass) {
+    b.vx += fX*b.invMass; b.vy += fY*b.invMass; b.vz += fZ*b.invMass;
+    const tau = rB.clone().cross(new THREE.Vector3(fX,fY,fZ));
+    b.omega.x += tau.x*b.invIX; b.omega.y += tau.y*b.invIY; b.omega.z += tau.z*b.invIZ;
+  }
+}
+
+/* ── RESOLVE MANIFOLD (multiple contact points) ──── */
+function resolveManifold(a, b, contacts, normal, depth) {
+  // Positional correction once (at average contact) — only if not already separating
+  const avg = contacts.reduce((s,v) => s.add(v), new THREE.Vector3()).divideScalar(contacts.length);
+  const rA = avg.clone().sub(a.pos);
+  const rB = avg.clone().sub(b.pos);
+  const va = new THREE.Vector3(a.vx+a.omega.y*rA.z-a.omega.z*rA.y, a.vy+a.omega.z*rA.x-a.omega.x*rA.z, a.vz+a.omega.x*rA.y-a.omega.y*rA.x);
+  const vb = new THREE.Vector3(b.vx+b.omega.y*rB.z-b.omega.z*rB.y, b.vy+b.omega.z*rB.x-b.omega.x*rB.z, b.vz+b.omega.x*rB.y-b.omega.y*rB.x);
+  const relVn = (vb.clone().sub(va)).dot(normal);
+  if (depth > SLOP && relVn <= 0) {
+    const corrMag = Math.max(depth - SLOP, 0) / (a.invMass + b.invMass) * BAUMGARTE;
+    const cp = normal.clone().multiplyScalar(corrMag);
+    if (a.invMass) a.pos.sub(cp.clone().multiplyScalar(a.invMass));
+    if (b.invMass) b.pos.add(cp.clone().multiplyScalar(b.invMass));
+  }
+
+  // Resolve each contact point. Only the first (deepest) contact gets restitution.
+  // Secondary contacts use e=0 to provide rotational stability without energy pump.
+  // Divide impulse by contact count to avoid over-resolving.
+  const count = contacts.length;
+  for (let i = 0; i < contacts.length; i++) {
+    resolveContactPoint(a, b, contacts[i], normal, i === 0, count);
+  }
+}
+
+function resolveContactPoint(a, b, contactPt, normal, useRestitution, count=1) {
+  const n = normal;
+  const c = contactPt;
+  const rA = c.clone().sub(a.pos);
+  const rB = c.clone().sub(b.pos);
+
+  const va = new THREE.Vector3(
+    a.vx + a.omega.y*rA.z - a.omega.z*rA.y,
+    a.vy + a.omega.z*rA.x - a.omega.x*rA.z,
+    a.vz + a.omega.x*rA.y - a.omega.y*rA.x
+  );
+  const vb = new THREE.Vector3(
+    b.vx + b.omega.y*rB.z - b.omega.z*rB.y,
+    b.vy + b.omega.z*rB.x - b.omega.x*rB.z,
+    b.vz + b.omega.x*rB.y - b.omega.y*rB.x
+  );
+  const relV = vb.clone().sub(va);
+  const vn = relV.dot(n);
+  if (vn > 0) return;
+
+  const rAxN = rA.clone().cross(n);
+  const rBxN = rB.clone().cross(n);
+  const invMA = a.invMass + rAxN.x*a.invIX*rAxN.x + rAxN.y*a.invIY*rAxN.y + rAxN.z*a.invIZ*rAxN.z;
+  const invMB = b.invMass + rBxN.x*b.invIX*rBxN.x + rBxN.y*b.invIY*rBxN.y + rBxN.z*b.invIZ*rBxN.z;
+  const invME = invMA + invMB;
+  if (invME < 1e-10) return;
+
+  const e = useRestitution ? Math.min(a.restitution, b.restitution) : 0;
+  const jn = -(1+e)*vn / invME / count;
+  if (jn <= 0) return;
+
+  const impX = jn*n.x, impY = jn*n.y, impZ = jn*n.z;
+  if (a.invMass) {
+    a.vx -= impX*a.invMass; a.vy -= impY*a.invMass; a.vz -= impZ*a.invMass;
+    const tau = rA.clone().cross(new THREE.Vector3(impX, impY, impZ));
+    a.omega.x -= tau.x*a.invIX; a.omega.y -= tau.y*a.invIY; a.omega.z -= tau.z*a.invIZ;
+  }
+  if (b.invMass) {
+    b.vx += impX*b.invMass; b.vy += impY*b.invMass; b.vz += impZ*b.invMass;
+    const tau = rB.clone().cross(new THREE.Vector3(impX, impY, impZ));
+    b.omega.x += tau.x*b.invIX; b.omega.y += tau.y*b.invIY; b.omega.z += tau.z*b.invIZ;
+  }
+
+  // Friction
+  const va2 = new THREE.Vector3(
+    a.vx+a.omega.y*rA.z-a.omega.z*rA.y, a.vy+a.omega.z*rA.x-a.omega.x*rA.z, a.vz+a.omega.x*rA.y-a.omega.y*rA.x
+  );
+  const vb2 = new THREE.Vector3(
+    b.vx+b.omega.y*rB.z-b.omega.z*rB.y, b.vy+b.omega.z*rB.x-b.omega.x*rB.z, b.vz+b.omega.x*rB.y-b.omega.y*rB.x
+  );
+  const relV2 = vb2.clone().sub(va2);
+  let tan = relV2.clone().sub(n.clone().multiplyScalar(relV2.dot(n)));
+  const tl = tan.length();
+  if (tl < 1e-6) return;
+  tan.normalize();
+  const rAxT = rA.clone().cross(tan);
+  const rBxT = rB.clone().cross(tan);
+  const invMA2 = a.invMass+rAxT.x*a.invIX*rAxT.x+rAxT.y*a.invIY*rAxT.y+rAxT.z*a.invIZ*rAxT.z;
+  const invMB2 = b.invMass+rBxT.x*b.invIX*rBxT.x+rBxT.y*b.invIY*rBxT.y+rBxT.z*b.invIZ*rBxT.z;
+  const invME2 = invMA2+invMB2;
+  if (invME2 < 1e-10) return;
+  let jt = -relV2.dot(tan)/invME2;
+  const mu = (a.friction+b.friction)/2;
+  if (jt > jn*mu) jt = jn*mu; else if (jt < -jn*mu) jt = -jn*mu;
+  const fX = jt*tan.x, fY = jt*tan.y, fZ = jt*tan.z;
+  if (a.invMass) {
+    a.vx -= fX*a.invMass; a.vy -= fY*a.invMass; a.vz -= fZ*a.invMass;
+    const tau = rA.clone().cross(new THREE.Vector3(fX,fY,fZ));
+    a.omega.x -= tau.x*a.invIX; a.omega.y -= tau.y*a.invIY; a.omega.z -= tau.z*a.invIZ;
+  }
+  if (b.invMass) {
+    b.vx += fX*b.invMass; b.vy += fY*b.invMass; b.vz += fZ*b.invMass;
+    const tau = rB.clone().cross(new THREE.Vector3(fX,fY,fZ));
+    b.omega.x += tau.x*b.invIX; b.omega.y += tau.y*b.invIY; b.omega.z += tau.z*b.invIZ;
+  }
+}
+
+/* ── FLOOR COLLISION WITH MANIFOLD ────────────────── */
+function resolveFloorCollision(body) {
+  if (body.isStatic) return;
+  const verts = body.vertices();
+  // Find bottom vertices
+  const bottomVerts = verts.filter(v => v.y < FLOOR_Y + 0.1)
+    .sort((a,b) => a.y - b.y)
+    .slice(0, CONTACT_MAX);
+
+  if (bottomVerts.length === 0) return;
+
+  // Project to floor level
+  const contacts = bottomVerts.map(v => new THREE.Vector3(v.x, FLOOR_Y, v.z));
+
+  // Positional correction at average — only push up if not already separating
+  const minY = Math.min(...verts.map(v => v.y));
+  const depth = FLOOR_Y - minY;
+  if (depth > SLOP && body.vy <= 0) {
+    const corrMag = Math.max(depth - SLOP, 0) / body.invMass * BAUMGARTE;
+    body.pos.y += corrMag;
+  }
+
+  // Resolve each contact point
+  // First contact gets restitution; others provide stability (e=0).
+  // Impulse is divided by contact count to avoid over-resolving.
+  const normal = new THREE.Vector3(0, 1, 0);
+  const count = contacts.length;
+  let usedRestitution = false;
+  for (const c of contacts) {
+    const r = c.clone().sub(body.pos);
+    const va = new THREE.Vector3(
+      body.vx + body.omega.y*r.z - body.omega.z*r.y,
+      body.vy + body.omega.z*r.x - body.omega.x*r.z,
+      body.vz + body.omega.x*r.y - body.omega.y*r.x
+    );
+    const vn = va.y;
+    if (vn > 0) continue;
+
+    const rCrossN = r.clone().cross(normal);
+    const invMA = body.invMass + rCrossN.x*body.invIX*rCrossN.x + rCrossN.y*body.invIY*rCrossN.y + rCrossN.z*body.invIZ*rCrossN.z;
+    if (invMA < 1e-10) continue;
+
+    const e = usedRestitution ? 0 : body.restitution;
+    const jn = -(1+e)*vn / invMA / count;  // divide by contact count
+    if (jn <= 0) continue;
+    usedRestitution = true;
+
+    const impX = jn*normal.x, impY = jn*normal.y, impZ = jn*normal.z;
+    body.vx -= impX*body.invMass; body.vy -= impY*body.invMass; body.vz -= impZ*body.invMass;
+    const tau = r.clone().cross(new THREE.Vector3(impX,impY,impZ));
+    body.omega.x -= tau.x*body.invIX; body.omega.y -= tau.y*body.invIY; body.omega.z -= tau.z*body.invIZ;
+
+    // Friction
+    const va2 = new THREE.Vector3(
+      body.vx+body.omega.y*r.z-body.omega.z*r.y,
+      body.vy+body.omega.z*r.x-body.omega.x*r.z,
+      body.vz+body.omega.x*r.y-body.omega.y*r.x
+    );
+    let tan = new THREE.Vector3(va2.x, 0, va2.z);
+    const tl = tan.length();
+    if (tl < 1e-6) continue;
+    tan.normalize();
+    const rCrossT = r.clone().cross(tan);
+    const invMA2 = body.invMass+rCrossT.x*body.invIX*rCrossT.x+rCrossT.y*body.invIY*rCrossT.y+rCrossT.z*body.invIZ*rCrossT.z;
+    if (invMA2 < 1e-10) continue;
+    let jt = -(va2.dot(tan))/invMA2;
+    const mu = body.friction;
+    if (jt > jn*mu) jt = jn*mu; else if (jt < -jn*mu) jt = -jn*mu;
+    const fX = jt*tan.x, fY = jt*tan.y, fZ = jt*tan.z;
+    body.vx -= fX*body.invMass; body.vy -= fY*body.invMass; body.vz -= fZ*body.invMass;
+    const tau2 = r.clone().cross(new THREE.Vector3(fX,fY,fZ));
+    body.omega.x -= tau2.x*body.invIX; body.omega.y -= tau2.y*body.invIY; body.omega.z -= tau2.z*body.invIZ;
+  }
+}
+
+/* ── SPATIAL HASH ────────────────────────────────── */
+class Grid {
+  constructor(cs=2){ this.cs=cs; this.cells=new Map(); }
+  clear(){ this.cells.clear(); }
+  _k(x,y,z){ return `${x},${y},${z}`; }
+  insert(b){
+    const a=b.aabb();
+    const x0=Math.floor(a.minX/this.cs),x1=Math.floor(a.maxX/this.cs);
+    const y0=Math.floor(a.minY/this.cs),y1=Math.floor(a.maxY/this.cs);
+    const z0=Math.floor(a.minZ/this.cs),z1=Math.floor(a.maxZ/this.cs);
+    for(let x=x0;x<=x1;x++)for(let y=y0;y<=y1;y++)for(let z=z0;z<=z1;z++){
+      const k=this._k(x,y,z);
+      if(!this.cells.has(k)) this.cells.set(k,[]);
+      this.cells.get(k).push(b);
+    }
+  }
+  query(b){
+    const s=new Set();
+    const a=b.aabb();
+    const x0=Math.floor(a.minX/this.cs),x1=Math.floor(a.maxX/this.cs);
+    const y0=Math.floor(a.minY/this.cs),y1=Math.floor(a.maxY/this.cs);
+    const z0=Math.floor(a.minZ/this.cs),z1=Math.floor(a.maxZ/this.cs);
+    for(let x=x0;x<=x1;x++)for(let y=y0;y<=y1;y++)for(let z=z0;z<=z1;z++){
+      const c=this.cells.get(this._k(x,y,z));
+      if(c) for(const b2 of c) if(b2!==b) s.add(b2);
+    }
+    return s;
+  }
+}
+const g = new Grid(2);
+
+/* ── PHYSICS STEP ────────────────────────────────── */
+function step(dt) {
+  // 1. Integrate
+  for (const b of bodies) {
+    if (b.isStatic) continue;
+    b.vy += GRAVITY * dt;
+    b.pos.x += b.vx * dt;
+    b.pos.y += b.vy * dt;
+    b.pos.z += b.vz * dt;
+    const ox=b.omega.x*0.5, oy=b.omega.y*0.5, oz=b.omega.z*0.5;
+    const qx=b.quat.x, qy=b.quat.y, qz=b.quat.z, qw=b.quat.w;
+    b.quat.x += (ox*qw + oy*qz - oz*qy)*dt;
+    b.quat.y += (-ox*qz + oy*qw + oz*qx)*dt;
+    b.quat.z += (ox*qy - oy*qx + oz*qw)*dt;
+    b.quat.w += (-ox*qx - oy*qy - oz*qz)*dt;
+    b.quat.normalize();
+  }
+
+  // 2. Floor collision with manifold
+  for (const b of bodies) resolveFloorCollision(b);
+
+  // 3. Broad phase
+  g.clear();
+  for (const b of bodies) g.insert(b);
+
+  // 4. Narrow phase + manifold resolve
+  const seen = new Set();
+  for (let i = 0; i < bodies.length; i++) {
+    const a = bodies[i];
+    for (const b of g.query(a)) {
+      const j = bodies.indexOf(b);
+      if (j <= i) continue;
+      const key = `${i}-${j}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const sat = satOBB(a, b);
+      if (sat) {
+        const man = generateManifold(a, b, sat);
+        if (man.contacts.length > 0) {
+          resolveManifold(a, b, man.contacts, man.normal, sat.depth);
+        }
+      }
+    }
+  }
+
+  // 5. CCD safety net — just prevent tunneling, zero velocity correction
+  for (const b of bodies) {
+    if (b.isStatic) continue;
+    const a = b.aabb();
+    if (a.minY < FLOOR_Y) {
+      b.pos.y += (FLOOR_Y - a.minY) + 0.001;
+      if (b.vy < 0) b.vy = 0;
+    }
+  }
+
+  // 6. Damping + sleep
+  for (const b of bodies) {
+    if (b.isStatic) continue;
+    const s2 = b.vx*b.vx+b.vy*b.vy+b.vz*b.vz;
+    const w2 = b.omega.lengthSq();
+    if (s2 > 1e-4 || w2 > 1e-4) {
+      b.vx *= 0.995; b.vy *= 0.995; b.vz *= 0.995;
+      b.omega.multiplyScalar(0.99);
+    }
+    if (s2 < 1e-6 && w2 < 1e-6) {
+      b.vx=b.vy=b.vz=0; b.omega.set(0,0,0);
+    }
+  }
+}
+
+/* ── RENDER ──────────────────────────────────────── */
+const clock = new THREE.Clock();
+let fc=0, ft=0;
+const fpsEl = document.getElementById('fps');
+const countEl = document.getElementById('count');
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 1/30);
+  fc++; ft += dt;
+  if (ft >= 0.5) { fpsEl.textContent = Math.round(fc/ft); fc=0; ft=0; }
+
+  const subDt = dt / SUBSTEPS;
+  for (let s = 0; s < SUBSTEPS; s++) step(subDt);
+
+  for (const b of bodies) {
+    b.mesh.position.copy(b.pos);
+    b.mesh.quaternion.copy(b.quat);
+  }
+  countEl.textContent = bodies.length;
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+renderer.domElement.addEventListener('click', () => {
+  spawnBlock((Math.random()-.5)*8, 10+Math.random()*6, (Math.random()-.5)*4, 0.5+Math.random()*0.6);
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

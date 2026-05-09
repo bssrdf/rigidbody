@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Rigid Body Simulator | Sequential Impulse with Warm Start</title>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    #info {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      background: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 10px 20px;
+      border-radius: 8px;
+      pointer-events: none;
+      backdrop-filter: blur(5px);
+      box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+    }
+    .controls {
+      position: absolute;
+      bottom: 30px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(20, 20, 30, 0.8);
+      backdrop-filter: blur(8px);
+      padding: 12px 25px;
+      border-radius: 40px;
+      display: flex;
+      gap: 20px;
+      color: #ddd;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+    button {
+      background: #ff6b6b;
+      border: none;
+      color: white;
+      padding: 10px 24px;
+      border-radius: 30px;
+      font-weight: bold;
+      cursor: pointer;
+      font-size: 16px;
+      letter-spacing: 0.5px;
+      transition: background 0.2s, transform 0.1s;
+      box-shadow: 0 2px 8px rgba(255,107,107,0.4);
+    }
+    button:hover {
+      background: #ff5252;
+    }
+    button:active {
+      transform: scale(0.96);
+    }
+    button.reset-btn {
+      background: #4ecdc4;
+      box-shadow: 0 2px 8px rgba(78,205,196,0.4);
+    }
+    button.reset-btn:hover {
+      background: #3dbdb5;
+    }
+    .stats {
+      display: flex;
+      align-items: center;
+      gap: 15px;
+      margin-left: 10px;
+      color: #ccc;
+    }
+    @media (max-width: 700px) {
+      .controls {
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 10px;
+        padding: 12px 15px;
+      }
+      button {
+        padding: 8px 16px;
+        font-size: 14px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="info">
+    <h2>⚡ Sequential Impulse + Warm Start</h2>
+    <p>Spheres • Boxes • Plane | Drag mouse to view</p>
+  </div>
+  <div class="controls">
+    <button id="addSphere">➕ Add Sphere</button>
+    <button id="addBox">📦 Add Box</button>
+    <button class="reset-btn" id="reset">🔄 Reset Scene</button>
+    <div class="stats">
+      <span id="bodyCount">0</span> bodies
+    </div>
+  </div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.126.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.126.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // ---------- PHYSICS CORE ----------
+    const GRAVITY = -9.81;
+    const ITERATIONS = 10;
+    const ALLOWED_PENETRATION = 0.01;
+    const BAUMGARTE = 0.15;
+    const RESTITUTION = 0.3;
+    const FRICTION_COEF = 0.4;
+
+    class ContactPoint {
+      constructor() {
+        this.normal = new THREE.Vector3();
+        this.point = new THREE.Vector3();
+        this.penetration = 0;
+        this.normalImpulse = 0;
+        this.tangentImpulse = new THREE.Vector2(0, 0);
+        this.bodyA = null;
+        this.bodyB = null;
+        this.restitution = RESTITUTION;
+        this.friction = FRICTION_COEF;
+        this.rA = new THREE.Vector3();
+        this.rB = new THREE.Vector3();
+      }
+    }
+
+    class RigidBody {
+      constructor(shape, mass, position, quaternion, sizeParams) {
+        this.shape = shape;
+        this.mass = mass;
+        this.invMass = mass === 0 ? 0 : 1.0 / mass;
+        
+        this.position = position.clone();
+        this.rotation = quaternion ? quaternion.clone() : new THREE.Quaternion();
+        
+        this.linearVelocity = new THREE.Vector3(0, 0, 0);
+        this.angularVelocity = new THREE.Vector3(0, 0, 0);
+        
+        this.force = new THREE.Vector3(0, 0, 0);
+        this.torque = new THREE.Vector3(0, 0, 0);
+        
+        this.inertia = new THREE.Vector3();
+        this.invInertia = new THREE.Vector3();
+        
+        this.radius = sizeParams?.radius || 0.5;
+        this.halfExtents = sizeParams?.halfExtents || new THREE.Vector3(0.5, 0.5, 0.5);
+        
+        this.calculateInertia();
+        
+        this.mesh = null;
+      }
+      
+      calculateInertia() {
+        if (this.mass === 0) {
+          this.inertia.set(0, 0, 0);
+          this.invInertia.set(0, 0, 0);
+          return;
+        }
+        
+        if (this.shape === 'sphere') {
+          const I = (2.0 / 5.0) * this.mass * this.radius * this.radius;
+          this.inertia.set(I, I, I);
+        } else if (this.shape === 'box') {
+          const hx = this.halfExtents.x;
+          const hy = this.halfExtents.y;
+          const hz = this.halfExtents.z;
+          const Ix = (1.0 / 12.0) * this.mass * (4 * hy * hy + 4 * hz * hz);
+          const Iy = (1.0 / 12.0) * this.mass * (4 * hx * hx + 4 * hz * hz);
+          const Iz = (1.0 / 12.0) * this.mass * (4 * hx * hx + 4 * hy * hy);
+          this.inertia.set(Ix, Iy, Iz);
+        } else {
+          this.inertia.set(1, 1, 1);
+        }
+        
+        this.invInertia.set(
+          this.inertia.x !== 0 ? 1.0 / this.inertia.x : 0,
+          this.inertia.y !== 0 ? 1.0 / this.inertia.y : 0,
+          this.inertia.z !== 0 ? 1.0 / this.inertia.z : 0
+        );
+      }
+      
+      getWorldInverseInertia() {
+        const rotMatrix = new THREE.Matrix4().makeRotationFromQuaternion(this.rotation);
+        const invI = this.invInertia;
+        
+        const R = rotMatrix;
+        const Rt = rotMatrix.clone().transpose();
+        
+        const localInv = new THREE.Matrix4().makeScale(invI.x, invI.y, invI.z);
+        const worldInv = R.clone().multiply(localInv).multiply(Rt);
+        
+        const m = worldInv.elements;
+        return new THREE.Matrix3().set(
+          m[0], m[1], m[2],
+          m[4], m[5], m[6],
+          m[8], m[9], m[10]
+        );
+      }
+      
+      applyImpulse(point, impulse) {
+        if (this.invMass === 0) return;
+        
+        this.linearVelocity.addScaledVector(impulse, this.invMass);
+        
+        const r = point.clone().sub(this.position);
+        const angularImpulse = r.clone().cross(impulse);
+        
+        const invInertiaWorld = this.getWorldInverseInertia();
+        const deltaOmega = angularImpulse.applyMatrix3(invInertiaWorld);
+        this.angularVelocity.add(deltaOmega);
+      }
+      
+      integrate(dt) {
+        if (this.invMass === 0) return;
+        
+        this.linearVelocity.addScaledVector(this.force, this.invMass * dt);
+        this.position.addScaledVector(this.linearVelocity, dt);
+        
+        const invInertiaWorld = this.getWorldInverseInertia();
+        const angularAcc = this.torque.applyMatrix3(invInertiaWorld);
+        this.angularVelocity.addScaledVector(angularAcc, dt);
+        
+        const w = this.angularVelocity;
+        const angle = w.length();
+        if (angle > 0.0001) {
+          const axis = w.clone().normalize();
+          const deltaQ = new THREE.Quaternion().setFromAxisAngle(axis, angle * dt);
+          this.rotation.multiply(deltaQ);
+          this.rotation.normalize();
+        }
+        
+        this.force.set(0, 0, 0);
+        this.torque.set(0, 0, 0);
+      }
+      
+      syncMesh() {
+        if (!this.mesh) return;
+        this.mesh.position.copy(this.position);
+        this.mesh.quaternion.copy(this.rotation);
+      }
+    }
+
+    // ---------- COLLISION DETECTION ----------
+    function getBoxCorners(body) {
+      const h = body.halfExtents;
+      const corners = [
+        new THREE.Vector3(-h.x, -h.y, -h.z),
+        new THREE.Vector3( h.x, -h.y, -h.z),
+        new THREE.Vector3(-h.x,  h.y, -h.z),
+        new THREE.Vector3( h.x,  h.y, -h.z),
+        new THREE.Vector3(-h.x, -h.y,  h.z),
+        new THREE.Vector3( h.x, -h.y,  h.z),
+        new THREE.Vector3(-h.x,  h.y,  h.z),
+        new THREE.Vector3( h.x,  h.y,  h.z)
+      ];
+      const rotMatrix = new THREE.Matrix4().makeRotationFromQuaternion(body.rotation);
+      return corners.map(c => c.applyMatrix4(rotMatrix).add(body.position));
+    }
+
+    function getBoxFaces(body) {
+      const h = body.halfExtents;
+      const rotMatrix = new THREE.Matrix4().makeRotationFromQuaternion(body.rotation);
+      
+      // Face centers in local space
+      const faceCenters = [
+        { center: new THREE.Vector3(-h.x, 0, 0), normal: new THREE.Vector3(-1, 0, 0) },
+        { center: new THREE.Vector3( h.x, 0, 0), normal: new THREE.Vector3( 1, 0, 0) },
+        { center: new THREE.Vector3(0, -h.y, 0), normal: new THREE.Vector3(0, -1, 0) },
+        { center: new THREE.Vector3(0,  h.y, 0), normal: new THREE.Vector3(0,  1, 0) },
+        { center: new THREE.Vector3(0, 0, -h.z), normal: new THREE.Vector3(0, 0, -1) },
+        { center: new THREE.Vector3(0, 0,  h.z), normal: new THREE.Vector3(0, 0,  1) }
+      ];
+      
+      return faceCenters.map(face => ({
+        center: face.center.clone().applyMatrix4(rotMatrix).add(body.position),
+        normal: face.normal.clone().applyMatrix4(rotMatrix).normalize()
+      }));
+    }
+
+    function getBoxVerticesInWorld(body) {
+      const h = body.halfExtents;
+      const vertices = [
+        new THREE.Vector3(-h.x, -h.y, -h.z),
+        new THREE.Vector3( h.x, -h.y, -h.z),
+        new THREE.Vector3(-h.x,  h.y, -h.z),
+        new THREE.Vector3( h.x,  h.y, -h.z),
+        new THREE.Vector3(-h.x, -h.y,  h.z),
+        new THREE.Vector3( h.x, -h.y,  h.z),
+        new THREE.Vector3(-h.x,  h.y,  h.z),
+        new THREE.Vector3( h.x,  h.y,  h.z)
+      ];
+      const rotMatrix = new THREE.Matrix4().makeRotationFromQuaternion(body.rotation);
+      return vertices.map(v => v.clone().applyMatrix4(rotMatrix).add(body.position));
+    }
+
+    function getSupportPoint(body, direction) {
+      const vertices = getBoxVerticesInWorld(body);
+      let maxDot = -Infinity;
+      let supportPoint = vertices[0].clone();
+      
+      for (const vertex of vertices) {
+        const dot = vertex.dot(direction);
+        if (dot > maxDot) {
+          maxDot = dot;
+          supportPoint = vertex.clone();
+        }
+      }
+      return supportPoint;
+    }
+
+    function clipPolygonAgainstPlane(polygon, planePoint, planeNormal) {
+      const clippedPolygon = [];
+      
+      for (let i = 0; i < polygon.length; i++) {
+        const current = polygon[i];
+        const next = polygon[(i + 1) % polygon.length];
+        
+        const dCurrent = new THREE.Vector3().subVectors(current, planePoint).dot(planeNormal);
+        const dNext = new THREE.Vector3().subVectors(next, planePoint).dot(planeNormal);
+        
+        if (dCurrent >= 0) {
+          clippedPolygon.push(current.clone());
+        }
+        
+        if ((dCurrent >= 0 && dNext < 0) || (dCurrent < 0 && dNext >= 0)) {
+          const t = dCurrent / (dCurrent - dNext);
+          const intersection = current.clone().add(
+            new THREE.Vector3().subVectors(next, current).multiplyScalar(t)
+          );
+          clippedPolygon.push(intersection);
+        }
+      }
+      
+      return clippedPolygon;
+    }
+
+    function addBoxBoxContacts(a, b, contacts) {
+      // Get axes for SAT
+      const axesA = [
+        new THREE.Vector3(1, 0, 0).applyQuaternion(a.rotation).normalize(),
+        new THREE.Vector3(0, 1, 0).applyQuaternion(a.rotation).normalize(),
+        new THREE.Vector3(0, 0, 1).applyQuaternion(a.rotation).normalize()
+      ];
+      
+      const axesB = [
+        new THREE.Vector3(1, 0, 0).applyQuaternion(b.rotation).normalize(),
+        new THREE.Vector3(0, 1, 0).applyQuaternion(b.rotation).normalize(),
+        new THREE.Vector3(0, 0, 1).applyQuaternion(b.rotation).normalize()
+      ];
+      
+      const allAxes = [...axesA, ...axesB];
+      
+      // Add cross products
+      for (let i = 0; i < 3; i++) {
+        for (let j = 0; j < 3; j++) {
+          const cross = new THREE.Vector3().crossVectors(axesA[i], axesB[j]);
+          if (cross.lengthSq() > 0.0001) {
+            allAxes.push(cross.normalize());
+          }
+        }
+      }
+      
+      let minPenetration = Infinity;
+      let bestAxis = new THREE.Vector3();
+      
+      // SAT test
+      for (const axis of allAxes) {
+        const supportA = getSupportPoint(a, axis.clone().negate());
+        const supportB = getSupportPoint(b, axis);
+        
+        const projAMax = getSupportPoint(a, axis).dot(axis);
+        const projAMin = supportA.dot(axis);
+        const projBMax = getSupportPoint(b, axis).dot(axis);
+        const projBMin = supportB.dot(axis);
+        
+        const overlap = Math.min(projAMax, projBMax) - Math.max(projAMin, projBMin);
+        
+        if (overlap <= 0) {
+          return; // Separating axis found
+        }
+        
+        if (overlap < minPenetration) {
+          minPenetration = overlap;
+          bestAxis = axis.clone();
+        }
+      }
+      
+      if (minPenetration <= 0 || minPenetration === Infinity) return;
+      
+      // Determine normal direction (from A to B)
+      const centerDiff = new THREE.Vector3().subVectors(b.position, a.position);
+      if (bestAxis.dot(centerDiff) < 0) {
+        bestAxis.negate();
+      }
+      
+      // Find the reference face and incident face
+      let refBody, incBody;
+      let refFaceNormal;
+      
+      // Check which face is most perpendicular to the separation axis
+      let maxDotA = -Infinity, maxDotB = -Infinity;
+      let refFaceIdxA = 0, refFaceIdxB = 0;
+      
+      for (let i = 0; i < 3; i++) {
+        const dotA = Math.abs(axesA[i].dot(bestAxis));
+        const dotB = Math.abs(axesB[i].dot(bestAxis));
+        
+        if (dotA > maxDotA) {
+          maxDotA = dotA;
+          refFaceIdxA = i;
+        }
+        if (dotB > maxDotB) {
+          maxDotB = dotB;
+          refFaceIdxB = i;
+        }
+      }
+      
+      if (maxDotA > maxDotB) {
+        refBody = a;
+        incBody = b;
+        refFaceNormal = axesA[refFaceIdxA];
+        if (refFaceNormal.dot(bestAxis) < 0) refFaceNormal.negate();
+      } else {
+        refBody = b;
+        incBody = a;
+        refFaceNormal = axesB[refFaceIdxB];
+        if (refFaceNormal.dot(bestAxis) < 0) refFaceNormal.negate();
+      }
+      
+      // Get the reference face vertices
+      const refVertices = getBoxVerticesInWorld(refBody);
+      const refFaceVertices = [];
+      const refFaceCenter = refBody.position.clone().addScaledVector(refFaceNormal, 
+        refBody.halfExtents.x * Math.abs(axesA[0].dot(refFaceNormal)) +
+        refBody.halfExtents.y * Math.abs(axesA[1].dot(refFaceNormal)) +
+        refBody.halfExtents.z * Math.abs(axesA[2].dot(refFaceNormal))
+      );
+      
+      // Find vertices on the reference face
+      const tolerance = 0.01;
+      for (const vertex of refVertices) {
+        const dist = Math.abs(new THREE.Vector3().subVectors(vertex, refFaceCenter).dot(refFaceNormal));
+        if (dist < tolerance) {
+          refFaceVertices.push(vertex.clone());
+        }
+      }
+      
+      // Sort vertices to form a polygon (simple convex hull for face)
+      if (refFaceVertices.length >= 3) {
+        const center = new THREE.Vector3();
+        refFaceVertices.forEach(v => center.add(v));
+        center.divideScalar(refFaceVertices.length);
+        
+        // Create basis vectors on the face plane
+        const u = new THREE.Vector3().subVectors(refFaceVertices[0], center).normalize();
+        const v = new THREE.Vector3().crossVectors(refFaceNormal, u).normalize();
+        
+        refFaceVertices.sort((a, b) => {
+          const da = new THREE.Vector3().subVectors(a, center);
+          const db = new THREE.Vector3().subVectors(b, center);
+          return Math.atan2(da.dot(v), da.dot(u)) - Math.atan2(db.dot(v), db.dot(u));
+        });
+      }
+      
+      // Get incident face vertices
+      const incVertices = getBoxVerticesInWorld(incBody);
+      const incFaceNormal = bestAxis.clone().negate();
+      const incFaceVertices = [];
+      const incFaceCenter = incBody.position.clone().addScaledVector(incFaceNormal,
+        incBody.halfExtents.x * Math.abs(axesB[0].dot(incFaceNormal)) +
+        incBody.halfExtents.y * Math.abs(axesB[1].dot(incFaceNormal)) +
+        incBody.halfExtents.z * Math.abs(axesB[2].dot(incFaceNormal))
+      );
+      
+      for (const vertex of incVertices) {
+        const dist = Math.abs(new THREE.Vector3().subVectors(vertex, incFaceCenter).dot(incFaceNormal));
+        if (dist < tolerance) {
+          incFaceVertices.push(vertex.clone());
+        }
+      }
+      
+      // Sort incident face vertices
+      if (incFaceVertices.length >= 3) {
+        const center = new THREE.Vector3();
+        incFaceVertices.forEach(v => center.add(v));
+        center.divideScalar(incFaceVertices.length);
+        
+        const u = new THREE.Vector3().subVectors(incFaceVertices[0], center).normalize();
+        const v = new THREE.Vector3().crossVectors(incFaceNormal, u).normalize();
+        
+        incFaceVertices.sort((a, b) => {
+          const da = new THREE.Vector3().subVectors(a, center);
+          const db = new THREE.Vector3().subVectors(b, center);
+          return Math.atan2(da.dot(v), da.dot(u)) - Math.atan2(db.dot(v), db.dot(u));
+        });
+      }
+      
+      // Clip incident face against reference face planes
+      let clippedPolygon = [...incFaceVertices];
+      
+      // Clip against each edge of the reference face
+      for (let i = 0; i < refFaceVertices.length; i++) {
+        const current = refFaceVertices[i];
+        const next = refFaceVertices[(i + 1) % refFaceVertices.length];
+        
+        const edge = new THREE.Vector3().subVectors(next, current);
+        const edgeNormal = new THREE.Vector3().crossVectors(edge, refFaceNormal).normalize();
+        
+        // Ensure normal points inward
+        const toCenter = new THREE.Vector3().subVectors(refFaceCenter, current);
+        if (edgeNormal.dot(toCenter) < 0) {
+          edgeNormal.negate();
+        }
+        
+        clippedPolygon = clipPolygonAgainstPlane(clippedPolygon, current, edgeNormal);
+        
+        if (clippedPolygon.length === 0) break;
+      }
+      
+      // Create contact points from clipped polygon
+      for (const point of clippedPolygon) {
+        // Project point onto reference face plane
+        const distToRef = new THREE.Vector3().subVectors(point, refFaceCenter).dot(refFaceNormal);
+        const projectedPoint = point.clone().addScaledVector(refFaceNormal, -distToRef);
+        
+        const contact = new ContactPoint();
+        contact.bodyA = a;
+        contact.bodyB = b;
+        contact.normal = bestAxis.clone();
+        contact.penetration = minPenetration;
+        contact.point = projectedPoint.clone();
+        contact.rA = projectedPoint.clone().sub(a.position);
+        contact.rB = projectedPoint.clone().sub(b.position);
+        contact.restitution = RESTITUTION;
+        contact.friction = FRICTION_COEF;
+        contacts.push(contact);
+      }
+    }
+
+    function addSphereBoxContacts(sphere, box, contacts) {
+      const boxRotInv = box.rotation.clone().invert();
+      const localSphereCenter = sphere.position.clone().sub(box.position).applyQuaternion(boxRotInv);
+      const half = box.halfExtents;
+      
+      const closest = new THREE.Vector3(
+        Math.max(-half.x, Math.min(localSphereCenter.x, half.x)),
+        Math.max(-half.y, Math.min(localSphereCenter.y, half.y)),
+        Math.max(-half.z, Math.min(localSphereCenter.z, half.z))
+      );
+      
+      const delta = new THREE.Vector3().subVectors(localSphereCenter, closest);
+      const dist = delta.length();
+      
+      if (dist < sphere.radius && dist > 0.0001) {
+        const normalLocal = delta.normalize();
+        const worldNormal = normalLocal.clone().applyQuaternion(box.rotation);
+        
+        const contact = new ContactPoint();
+        contact.bodyA = sphere;
+        contact.bodyB = box;
+        contact.normal = worldNormal;
+        contact.penetration = sphere.radius - dist;
+        
+        const worldClosest = closest.clone().applyQuaternion(box.rotation).add(box.position);
+        contact.point = worldClosest.clone().addScaledVector(worldNormal, dist * 0.5);
+        contact.rA = contact.point.clone().sub(sphere.position);
+        contact.rB = contact.point.clone().sub(box.position);
+        contact.restitution = RESTITUTION;
+        contact.friction = FRICTION_COEF;
+        contacts.push(contact);
+      }
+    }
+
+    function detectCollisions(bodies) {
+      const contacts = [];
+      
+      for (let i = 0; i < bodies.length; i++) {
+        for (let j = i + 1; j < bodies.length; j++) {
+          const a = bodies[i];
+          const b = bodies[j];
+          
+          if (a.invMass === 0 && b.invMass === 0) continue;
+          
+          // Sphere-Sphere
+          if (a.shape === 'sphere' && b.shape === 'sphere') {
+            const normal = new THREE.Vector3().subVectors(b.position, a.position);
+            const dist = normal.length();
+            const radiusSum = a.radius + b.radius;
+            
+            if (dist < radiusSum && dist > 0.0001) {
+              const contact = new ContactPoint();
+              contact.bodyA = a;
+              contact.bodyB = b;
+              contact.normal = normal.normalize();
+              contact.penetration = radiusSum - dist;
+              contact.point = a.position.clone().addScaledVector(contact.normal, a.radius - contact.penetration * 0.5);
+              contact.rA = contact.point.clone().sub(a.position);
+              contact.rB = contact.point.clone().sub(b.position);
+              contact.restitution = RESTITUTION;
+              contacts.push(contact);
+            }
+          }
+          // Box-Box
+          else if (a.shape === 'box' && b.shape === 'box') {
+            addBoxBoxContacts(a, b, contacts);
+          }
+          // Sphere-Box
+          else if ((a.shape === 'sphere' && b.shape === 'box') || (a.shape === 'box' && b.shape === 'sphere')) {
+            const sphere = a.shape === 'sphere' ? a : b;
+            const box = a.shape === 'box' ? a : b;
+            addSphereBoxContacts(sphere, box, contacts);
+          }
+        }
+      }
+      
+      // Plane collisions
+      const groundY = -2.0;
+      const planeNormal = new THREE.Vector3(0, 1, 0);
+      
+      for (let body of bodies) {
+        if (body.invMass === 0 || body.shape === 'plane') continue;
+        
+        if (body.shape === 'sphere') {
+          const dist = body.position.y - body.radius - groundY;
+          if (dist < 0) {
+            const contact = new ContactPoint();
+            contact.bodyA = body;
+            contact.bodyB = null;
+            contact.normal = planeNormal.clone();
+            contact.penetration = -dist;
+            contact.point = body.position.clone().addScaledVector(planeNormal, -(body.radius - contact.penetration * 0.5));
+            contact.rA = contact.point.clone().sub(body.position);
+            contact.rB = new THREE.Vector3();
+            contact.restitution = RESTITUTION;
+            contact.friction = FRICTION_COEF;
+            contacts.push(contact);
+          }
+        } else if (body.shape === 'box') {
+          const corners = getBoxCorners(body);
+          let minY = Infinity;
+          for (let corner of corners) {
+            if (corner.y < minY) minY = corner.y;
+          }
+          const penetration = groundY - minY;
+          if (penetration > 0) {
+            const contact = new ContactPoint();
+            contact.bodyA = body;
+            contact.bodyB = null;
+            contact.normal = planeNormal.clone();
+            contact.penetration = penetration;
+            contact.point = body.position.clone();
+            contact.point.y = minY + penetration * 0.5;
+            contact.rA = contact.point.clone().sub(body.position);
+            contact.rB = new THREE.Vector3();
+            contact.restitution = RESTITUTION;
+            contact.friction = FRICTION_COEF;
+            contacts.push(contact);
+          }
+        }
+      }
+      
+      return contacts;
+    }
+
+    // ---------- SOLVER (Sequential Impulse with Warm Start) ----------
+    function solveContacts(contacts, dt) {
+      // Apply warm start impulses
+      for (let contact of contacts) {
+        if (!contact.bodyA || (contact.bodyA.invMass === 0 && (!contact.bodyB || contact.bodyB.invMass === 0))) continue;
+        
+        const normal = contact.normal;
+        const tangent1 = new THREE.Vector3();
+        const tangent2 = new THREE.Vector3();
+        
+        if (Math.abs(normal.x) < 0.9) tangent1.set(1, 0, 0).cross(normal).normalize();
+        else tangent1.set(0, 1, 0).cross(normal).normalize();
+        tangent2.crossVectors(normal, tangent1);
+        
+        const Pn = normal.clone().multiplyScalar(contact.normalImpulse);
+        const Pt = tangent1.clone().multiplyScalar(contact.tangentImpulse.x)
+                  .add(tangent2.clone().multiplyScalar(contact.tangentImpulse.y));
+        
+        if (contact.bodyA && contact.bodyA.invMass > 0) {
+          contact.bodyA.applyImpulse(contact.rA, Pn.clone().add(Pt).clone().negate());
+        }
+        if (contact.bodyB && contact.bodyB.invMass > 0) {
+          contact.bodyB.applyImpulse(contact.rB, Pn.clone().add(Pt));
+        }
+      }
+      
+      // Sequential impulse iterations
+      for (let iter = 0; iter < ITERATIONS; iter++) {
+        for (let contact of contacts) {
+          if (!contact.bodyA) continue;
+          
+          const bodyA = contact.bodyA;
+          const bodyB = contact.bodyB;
+          const normal = contact.normal;
+          const rA = contact.rA;
+          const rB = contact.rB;
+          
+          const velA = bodyA.linearVelocity.clone().add(
+            new THREE.Vector3().crossVectors(bodyA.angularVelocity, rA)
+          );
+          const velB = bodyB ? bodyB.linearVelocity.clone().add(
+            new THREE.Vector3().crossVectors(bodyB.angularVelocity, rB)
+          ) : new THREE.Vector3(0, 0, 0);
+          
+          const relVel = new THREE.Vector3().subVectors(velA, velB);
+          const normalRelVel = relVel.dot(normal);
+          
+          let invMassSum = bodyA.invMass;
+          if (bodyB) invMassSum += bodyB.invMass;
+          
+          const rAxn = new THREE.Vector3().crossVectors(rA, normal);
+          const rBxn = bodyB ? new THREE.Vector3().crossVectors(rB, normal) : new THREE.Vector3();
+          
+          let invInertiaTerm = new THREE.Vector3();
+          if (bodyA.invMass > 0) {
+            const invIA = bodyA.getWorldInverseInertia();
+            invInertiaTerm.add(rAxn.clone().applyMatrix3(invIA).cross(rA));
+          }
+          if (bodyB && bodyB.invMass > 0) {
+            const invIB = bodyB.getWorldInverseInertia();
+            invInertiaTerm.add(rBxn.clone().applyMatrix3(invIB).cross(rB));
+          }
+          
+          const effectiveMass = invMassSum + normal.dot(invInertiaTerm);
+          if (effectiveMass <= 0) continue;
+          
+          const bias = (BAUMGARTE / dt) * Math.max(0, contact.penetration - ALLOWED_PENETRATION);
+          
+          const deltaLambda = (-(normalRelVel) + bias) / effectiveMass;
+          
+          const oldImpulse = contact.normalImpulse;
+          contact.normalImpulse = Math.max(0, oldImpulse + deltaLambda);
+          const appliedDelta = contact.normalImpulse - oldImpulse;
+          
+          const impulse = normal.clone().multiplyScalar(appliedDelta);
+          if (bodyA.invMass > 0) bodyA.applyImpulse(rA, impulse.clone().negate());
+          if (bodyB && bodyB.invMass > 0) bodyB.applyImpulse(rB, impulse);
+          
+          // Friction
+          const tangent1 = new THREE.Vector3();
+          const tangent2 = new THREE.Vector3();
+          if (Math.abs(normal.x) < 0.9) tangent1.set(1, 0, 0).cross(normal).normalize();
+          else tangent1.set(0, 1, 0).cross(normal).normalize();
+          tangent2.crossVectors(normal, tangent1);
+          
+          const relVelAfterNormal = bodyA.linearVelocity.clone().add(
+            new THREE.Vector3().crossVectors(bodyA.angularVelocity, rA)
+          ).sub(bodyB ? bodyB.linearVelocity.clone().add(new THREE.Vector3().crossVectors(bodyB.angularVelocity, rB)) : new THREE.Vector3());
+          
+          const tangentRelVel = new THREE.Vector2(
+            relVelAfterNormal.dot(tangent1),
+            relVelAfterNormal.dot(tangent2)
+          );
+          
+          const maxFriction = contact.friction * contact.normalImpulse;
+          
+          const oldTangentImpulse = contact.tangentImpulse.clone();
+          const deltaFriction = new THREE.Vector2(
+            -tangentRelVel.x / effectiveMass,
+            -tangentRelVel.y / effectiveMass
+          );
+          
+          contact.tangentImpulse.add(deltaFriction);
+          
+          const len = contact.tangentImpulse.length();
+          if (len > maxFriction && len > 0.0001) {
+            contact.tangentImpulse.multiplyScalar(maxFriction / len);
+          }
+          
+          const frictionDelta = new THREE.Vector2().subVectors(contact.tangentImpulse, oldTangentImpulse);
+          const frictionImpulse = tangent1.clone().multiplyScalar(frictionDelta.x)
+                                  .add(tangent2.clone().multiplyScalar(frictionDelta.y));
+          
+          if (bodyA.invMass > 0) bodyA.applyImpulse(rA, frictionImpulse.clone().negate());
+          if (bodyB && bodyB.invMass > 0) bodyB.applyImpulse(rB, frictionImpulse);
+        }
+      }
+    }
+
+    // ---------- SCENE SETUP ----------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+    
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.5, 100);
+    camera.position.set(8, 6, 12);
+    camera.lookAt(0, 0, 0);
+    
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+    
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.target.set(0, 0, 0);
+    controls.maxPolarAngle = Math.PI / 1.8;
+    
+    // Lighting
+    const ambientLight = new THREE.AmbientLight(0x404066);
+    scene.add(ambientLight);
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+    dirLight.position.set(5, 12, 8);
+    dirLight.castShadow = true;
+    dirLight.receiveShadow = true;
+    dirLight.shadow.mapSize.width = 512;
+    dirLight.shadow.mapSize.height = 512;
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 40;
+    dirLight.shadow.camera.left = -10;
+    dirLight.shadow.camera.right = 10;
+    dirLight.shadow.camera.top = 10;
+    dirLight.shadow.camera.bottom = -5;
+    scene.add(dirLight);
+    
+    // Ground plane
+    const groundGeometry = new THREE.CircleGeometry(8, 64);
+    const groundMaterial = new THREE.MeshStandardMaterial({ color: 0x2d2d44, roughness: 0.7, metalness: 0.3 });
+    const groundMesh = new THREE.Mesh(groundGeometry, groundMaterial);
+    groundMesh.rotation.x = -Math.PI / 2;
+    groundMesh.position.y = -2;
+    groundMesh.receiveShadow = true;
+    scene.add(groundMesh);
+    
+    const gridHelper = new THREE.GridHelper(16, 20, 0x888888, 0x444444);
+    gridHelper.position.y = -1.99;
+    scene.add(gridHelper);
+    
+    // Physics world
+    const bodies = [];
+    
+    function createSphere(radius = 0.6, pos = new THREE.Vector3(0, 3, 0), mass = 1.0) {
+      const geometry = new THREE.SphereGeometry(radius, 32, 16);
+      const material = new THREE.MeshStandardMaterial({ 
+        color: new THREE.Color(Math.random() * 0.5 + 0.4, Math.random() * 0.6 + 0.4, Math.random() * 0.8 + 0.2), 
+        roughness: 0.3, 
+        metalness: 0.1 
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.position.copy(pos);
+      scene.add(mesh);
+      
+      const body = new RigidBody('sphere', mass, pos, null, { radius });
+      body.mesh = mesh;
+      bodies.push(body);
+      updateBodyCount();
+      return body;
+    }
+    
+    function createBox(halfExtents = new THREE.Vector3(0.6, 0.4, 0.7), pos = new THREE.Vector3(0, 3, 0), mass = 1.0) {
+      const geometry = new THREE.BoxGeometry(halfExtents.x*2, halfExtents.y*2, halfExtents.z*2);
+      const material = new THREE.MeshStandardMaterial({ 
+        color: new THREE.Color(Math.random() * 0.7 + 0.3, Math.random() * 0.5 + 0.2, Math.random() * 0.9 + 0.1), 
+        roughness: 0.4, 
+        metalness: 0.2 
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.position.copy(pos);
+      scene.add(mesh);
+      
+      const body = new RigidBody('box', mass, pos, new THREE.Quaternion(), { halfExtents });
+      body.mesh = mesh;
+      bodies.push(body);
+      updateBodyCount();
+      return body;
+    }
+    
+    function updateBodyCount() {
+      document.getElementById('bodyCount').textContent = bodies.length;
+    }
+    
+    function resetScene() {
+      while (bodies.length > 0) {
+        const body = bodies.pop();
+        if (body.mesh) scene.remove(body.mesh);
+      }
+      updateBodyCount();
+      
+      // Add initial objects with some rotation for testing
+      createSphere(0.55, new THREE.Vector3(-0.8, 2.5, 0.2), 1.2);
+      const box1 = createBox(new THREE.Vector3(0.5, 0.45, 0.5), new THREE.Vector3(0.9, 1.8, -0.3), 1.0);
+      box1.rotation.setFromEuler(new THREE.Euler(0.2, 0.3, 0.1));
+      box1.syncMesh();
+      
+      createSphere(0.5, new THREE.Vector3(0.2, 4.2, 0.7), 0.9);
+      const box2 = createBox(new THREE.Vector3(0.7, 0.35, 0.4), new THREE.Vector3(-0.5, 3.3, -0.6), 1.1);
+      box2.rotation.setFromEuler(new THREE.Euler(-0.1, 0.4, -0.2));
+      box2.syncMesh();
+      
+      createSphere(0.65, new THREE.Vector3(0.1, 2.0, -0.9), 1.3);
+    }
+    
+    document.getElementById('addSphere').addEventListener('click', () => {
+      const x = (Math.random() - 0.5) * 2.5;
+      const z = (Math.random() - 0.5) * 2.5;
+      createSphere(0.4 + Math.random()*0.4, new THREE.Vector3(x, 3.5 + Math.random()*2, z), 0.8 + Math.random()*0.8);
+    });
+    
+    document.getElementById('addBox').addEventListener('click', () => {
+      const x = (Math.random() - 0.5) * 2.5;
+      const z = (Math.random() - 0.5) * 2.5;
+      const hx = 0.3 + Math.random()*0.5;
+      const hy = 0.3 + Math.random()*0.5;
+      const hz = 0.3 + Math.random()*0.5;
+      const box = createBox(new THREE.Vector3(hx, hy, hz), new THREE.Vector3(x, 3.2 + Math.random()*2, z), 0.9 + Math.random()*1.1);
+      box.rotation.setFromEuler(new THREE.Euler(Math.random() * 0.5, Math.random() * 0.5, Math.random() * 0.5));
+      box.syncMesh();
+    });
+    
+    document.getElementById('reset').addEventListener('click', resetScene);
+    
+    resetScene();
+    
+    // Simulation loop
+    let lastTime = performance.now();
+    const fixedDt = 1/60;
+    
+    function animate() {
+      const now = performance.now();
+      let dt = (now - lastTime) / 1000;
+      if (dt > 0.1) dt = 0.1;
+      
+      const steps = Math.max(1, Math.floor(dt / fixedDt));
+      const stepDt = dt / steps;
+      
+      for (let s = 0; s < steps; s++) {
+        // Apply gravity
+        for (let body of bodies) {
+          if (body.invMass > 0) {
+            body.force.add(new THREE.Vector3(0, GRAVITY * body.mass, 0));
+          }
+        }
+        
+        // Integrate
+        for (let body of bodies) {
+          body.integrate(stepDt);
+        }
+        
+        // Collision detection
+        const contacts = detectCollisions(bodies);
+        
+        // Solve contacts
+        solveContacts(contacts, stepDt);
+        
+        // Sync meshes
+        for (let body of bodies) {
+          body.syncMesh();
+        }
+      }
+      
+      lastTime = now;
+      
+      controls.update();
+      renderer.render(scene, camera);
+      
+      requestAnimationFrame(animate);
+    }
+    
+    animate();
+    
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

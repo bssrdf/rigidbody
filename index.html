@@ -1,0 +1,1378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rigid Body Dynamics Simulator</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { overflow: hidden; background: #000; font-family: 'Segoe UI', sans-serif; }
+    canvas { display: block; }
+    #ui {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.7);
+      padding: 14px 18px;
+      border-radius: 8px;
+      pointer-events: none;
+      user-select: none;
+      line-height: 1.6;
+      font-size: 13px;
+    }
+    #ui b { color: #ffd700; }
+    #stats {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.7);
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-family: monospace;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div style="font-size: 16px; margin-bottom: 6px;">&nbsp;&nbsp;Rigid Body Dynamics</div>
+    <div><b>Click</b> / <b>Space</b> &rarr; Shoot ball</div>
+    <div><b>Right-drag</b> &rarr; Orbit camera</div>
+    <div><b>Scroll</b> &rarr; Zoom</div>
+    <div><b>R</b> &rarr; Reset scene</div>
+  </div>
+  <div id="stats"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <script>
+    (function () {
+      "use strict";
+
+      var PI = Math.PI;
+      var sqrt = Math.sqrt;
+      var min = Math.min;
+      var max = Math.max;
+      var abs = Math.abs;
+      var cos = Math.cos;
+      var sin = Math.sin;
+      var random = Math.random;
+      var EPS = 1e-7;
+      var dbg = { collisions: 0, contacts: 0 };
+
+      /* ========== Vec3 ========== */
+      function V3(x, y, z) {
+        this.x = x || 0;
+        this.y = y || 0;
+        this.z = z || 0;
+      }
+
+      V3.prototype.set = function (x, y, z) {
+        this.x = x;
+        this.y = y;
+        this.z = z;
+        return this;
+      };
+
+      V3.prototype.clone = function () {
+        return new V3(this.x, this.y, this.z);
+      };
+
+      V3.prototype.add = function (v) {
+        return new V3(this.x + v.x, this.y + v.y, this.z + v.z);
+      };
+
+      V3.prototype.sub = function (v) {
+        return new V3(this.x - v.x, this.y - v.y, this.z - v.z);
+      };
+
+      V3.prototype.mul = function (s) {
+        return new V3(this.x * s, this.y * s, this.z * s);
+      };
+
+      V3.prototype.dot = function (v) {
+        return this.x * v.x + this.y * v.y + this.z * v.z;
+      };
+
+      V3.prototype.cross = function (v) {
+        return new V3(
+          this.y * v.z - this.z * v.y,
+          this.z * v.x - this.x * v.z,
+          this.x * v.y - this.y * v.x
+        );
+      };
+
+      V3.prototype.len = function () {
+        return sqrt(this.x * this.x + this.y * this.y + this.z * this.z);
+      };
+
+      V3.prototype.lenSq = function () {
+        return this.x * this.x + this.y * this.y + this.z * this.z;
+      };
+
+      V3.prototype.normalize = function () {
+        var l = this.len();
+        if (l > EPS) {
+          this.x /= l;
+          this.y /= l;
+          this.z /= l;
+        }
+        return this;
+      };
+
+      V3.prototype.normalized = function () {
+        var l = this.len();
+        return l > EPS ? new V3(this.x / l, this.y / l, this.z / l) : new V3();
+      };
+
+      V3.prototype.negate = function () {
+        return new V3(-this.x, -this.y, -this.z);
+      };
+
+      V3.prototype.addScaled = function (v, s) {
+        this.x += v.x * s;
+        this.y += v.y * s;
+        this.z += v.z * s;
+        return this;
+      };
+
+      /* ========== Quat ========== */
+      function Q() {
+        this.x = 0;
+        this.y = 0;
+        this.z = 0;
+        this.w = 1;
+      }
+
+      Q.prototype.multiply = function (q) {
+        var ax = this.x, ay = this.y, az = this.z, aw = this.w;
+        var bx = q.x, by = q.y, bz = q.z, bw = q.w;
+        this.x = ax * bw + aw * bx + ay * bz - az * by;
+        this.y = ay * bw + aw * by + az * bx - ax * bz;
+        this.z = az * bw + aw * bz + ax * by - ay * bx;
+        this.w = aw * bw - ax * bx - ay * by - az * bz;
+        return this;
+      };
+
+      Q.prototype.normalize = function () {
+        var l = sqrt(this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w);
+        if (l > EPS) {
+          this.x /= l;
+          this.y /= l;
+          this.z /= l;
+          this.w /= l;
+        }
+        return this;
+      };
+
+      /* rotate vector by quaternion: q * v * q_conjugate */
+      function qRot(q, v) {
+        var x = q.x, y = q.y, z = q.z, w = q.w;
+        var vx = v.x, vy = v.y, vz = v.z;
+        var tx = 2 * (y * vz - z * vy);
+        var ty = 2 * (z * vx - x * vz);
+        var tz = 2 * (x * vy - y * vx);
+        return new V3(
+          vx + w * tx + (y * tz - z * ty),
+          vy + w * ty + (z * tx - x * tz),
+          vz + w * tz + (x * ty - y * tx)
+        );
+      }
+
+      /* rotate by conjugate: inverse rotation for unit quaternions */
+      function qRotInv(q, v) {
+        var x = -q.x, y = -q.y, z = -q.z, w = q.w;
+        var vx = v.x, vy = v.y, vz = v.z;
+        var tx = 2 * (y * vz - z * vy);
+        var ty = 2 * (z * vx - x * vz);
+        var tz = 2 * (x * vy - y * vx);
+        return new V3(
+          vx + w * tx + (y * tz - z * ty),
+          vy + w * ty + (z * tx - x * tz),
+          vz + w * tz + (x * ty - y * tx)
+        );
+      }
+
+      /* quaternion to 3x3 rotation matrix, column-major layout [9] */
+      function qToMat(q) {
+        var x = q.x, y = q.y, z = q.z, w = q.w;
+        return new Float64Array([
+          1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y),
+          2 * (x * y - w * z),   1 - 2 * (x * x + z * z), 2 * (y * z + w * x),
+          2 * (x * z + w * y),   2 * (y * z - w * x),   1 - 2 * (x * x + y * y)
+        ]);
+      }
+
+      /* matrix-vector multiply, column-major */
+      function matVec(M, v) {
+        return new V3(
+          M[0] * v.x + M[3] * v.y + M[6] * v.z,
+          M[1] * v.x + M[4] * v.y + M[7] * v.z,
+          M[2] * v.x + M[5] * v.y + M[8] * v.z
+        );
+      }
+
+      /* matrix-matrix multiply, column-major */
+      function matMul(A, B) {
+        var o = new Float64Array(9);
+        var i, j, k, s;
+        for (i = 0; i < 3; i++) {
+          for (j = 0; j < 3; j++) {
+            s = 0;
+            for (k = 0; k < 3; k++) {
+              s += A[i + k * 3] * B[k + j * 3];
+            }
+            o[i + j * 3] = s;
+          }
+        }
+        return o;
+      }
+
+      /* ========== Body ========== */
+      function Body(opts) {
+        this.id = opts.id || 0;
+        this.type = opts.type || 'dynamic';
+        this.pos = new V3(opts.x || 0, opts.y || 0, opts.z || 0);
+        this.q = new Q();
+        this.vel = new V3(opts.vx || 0, opts.vy || 0, opts.vz || 0);
+        this.angVel = new V3(opts.angVx || 0, opts.angVy || 0, opts.angVz || 0);
+        this.shape = opts.shape || 'box';
+        this.halfExtents = new V3(opts.hx || 0.5, opts.hy || 0.5, opts.hz || 0.5);
+        this.radius = opts.radius || 0.5;
+        this.mass = opts.mass || 1;
+        this.invMass = this.type === 'static' ? 0 : 1 / this.mass;
+        this.localInvI = new V3();
+        this._setupInertia();
+        this.restitution = opts.restitution !== undefined ? opts.restitution : 0.15;
+        this.friction = opts.friction !== undefined ? opts.friction : 0.5;
+        this.color = opts.color || 0x888888;
+        this.sleeping = false;
+        this.sleepTimer = 0;
+      }
+
+      Body.prototype._setupInertia = function () {
+        if (this.type === 'static') return;
+        var m = this.mass;
+        var he = this.halfExtents;
+        if (this.shape === 'box') {
+          var hx = he.x, hy = he.y, hz = he.z;
+          this.localInvI.set(
+            3 / (m * (hy * hy + hz * hz)),
+            3 / (m * (hx * hx + hz * hz)),
+            3 / (m * (hx * hx + hy * hy))
+          );
+        } else {
+          var r = this.radius;
+          var Iinv = 1 / (0.4 * m * r * r);
+          this.localInvI.set(Iinv, Iinv, Iinv);
+        }
+      };
+
+      /* World inverse inertia matrix = R * diag(localInvI) * R^T */
+      Body.prototype.getWorldInvI = function () {
+        var R = qToMat(this.q);
+        var li = this.localInvI;
+        var S = new Float64Array(9);
+        S[0] = R[0] * li.x;
+        S[1] = R[1] * li.x;
+        S[2] = R[2] * li.x;
+        S[3] = R[3] * li.y;
+        S[4] = R[4] * li.y;
+        S[5] = R[5] * li.y;
+        S[6] = R[6] * li.z;
+        S[7] = R[7] * li.z;
+        S[8] = R[8] * li.z;
+        return matMul(R, S);
+      };
+
+      Body.prototype.worldToLocal = function (p) {
+        return qRotInv(this.q, p.sub(this.pos));
+      };
+
+      Body.prototype.localToWorld = function (p) {
+        return qRot(this.q, p).add(this.pos);
+      };
+
+      Body.prototype.bodyAngVel = function () {
+        return qRotInv(this.q, this.angVel);
+      };
+
+      /* ========== Contact ========== */
+      function Contact() {
+        this.pos = new V3();
+        this.normal = new V3();
+        this.depth = 0;
+        this.bodyA = null;
+        this.bodyB = null;
+        this.flipImpulse = false;
+      }
+
+      /* ========== Collision Detection ========== */
+      /* Normal convention: bodyA→bodyB for sphere-vs-sphere and box-vs-box.
+         For sphere-vs-box, normal points outward from box surface (bodyB→bodyA),
+         marked with flipImpulse=true so resolveContact swaps impulse directions. */
+
+      function sphereVsSphere(a, b, contacts) {
+        var diff = b.pos.sub(a.pos);
+        var dist = diff.len();
+        var sumR = a.radius + b.radius;
+        if (dist > sumR || dist < EPS) return false;
+        var n = diff.mul(1 / dist);
+        var c = new Contact();
+        c.pos = a.pos.add(n.mul(a.radius));
+        c.normal = n;
+        c.depth = sumR - dist;
+        c.bodyA = a;
+        c.bodyB = b;
+        contacts.push(c);
+        return true;
+      }
+
+      function sphereVsBox(sphere, box, contacts) {
+        var sphereInBoxSpace = box.worldToLocal(sphere.pos);
+        var he = box.halfExtents;
+        var closest = new V3(
+          max(-he.x, min(he.x, sphereInBoxSpace.x)),
+          max(-he.y, min(he.y, sphereInBoxSpace.y)),
+          max(-he.z, min(he.z, sphereInBoxSpace.z))
+        );
+        var diff = sphereInBoxSpace.sub(closest);
+        var distSq = diff.lenSq();
+        if (distSq > sphere.radius * sphere.radius) return false;
+
+        var normal, depth;
+
+        if (distSq < EPS) {
+          /* sphere center inside box - find minimum penetration face */
+          var gaps = [
+            { axis: new V3(1, 0, 0), gap: he.x - abs(sphereInBoxSpace.x) },
+            { axis: new V3(0, 1, 0), gap: he.y - abs(sphereInBoxSpace.y) },
+            { axis: new V3(0, 0, 1), gap: he.z - abs(sphereInBoxSpace.z) }
+          ];
+          gaps.sort(function (a, b) { return a.gap - b.gap; });
+          var minGap = gaps[0];
+          /* normal: outward from box face (bodyB→bodyA convention) */
+          var dir = sphereInBoxSpace.dot(minGap.axis) >= 0 ? 1 : -1;
+          var localN = minGap.axis.mul(dir);
+          normal = qRot(box.q, localN);
+          depth = sphere.radius + minGap.gap;
+        } else {
+          var dist = sqrt(distSq);
+          /* normal: outward from box surface toward sphere center (bodyB→bodyA) */
+          var localN = diff.mul(1 / dist);
+          normal = qRot(box.q, localN);
+          depth = sphere.radius - dist;
+        }
+
+        var c = new Contact();
+        c.flipImpulse = true;
+        /* contact point: closest point on box surface, transformed to world space */
+        c.pos = box.localToWorld(closest);
+        c.normal = normal;
+        c.depth = depth;
+        c.bodyA = sphere;
+        c.bodyB = box;
+        contacts.push(c);
+        return true;
+      }
+
+      /* ---- clip helper for contact manifold ---- */
+      /* clip a polygon (array of V3) against a plane.
+         plane normal points OUT of the reference body, offset is distance from origin */
+      function clipPolyAgainstAxis(poly, axis, depth, out) {
+        var n = poly.length;
+        if (n === 0) return;
+        var depthVal = depth;
+        var nv0 = axis.dot(poly[0]) - depthVal;
+        var nv1 = axis.dot(poly[n - 1]) - depthVal;
+        var outIdx = 0;
+
+        for (var i = 0; i < n; i++) {
+          var curr = poly[i];
+          var prev = poly[(i + n - 1) % n];
+          if (nv0 <= 0) {
+            if (nv1 < 0) {
+              var t = nv0 / (nv0 - nv1);
+              out[outIdx] = new V3(
+                // poly[i].x + t * (poly[(i + 1) % n].x - poly[i].x),
+                // poly[i].y + t * (poly[(i + 1) % n].y - poly[i].y),
+                // poly[i].z + t * (poly[(i + 1) % n].z - poly[i].z)
+                prev.x + t * (curr.x - prev.x),
+                prev.y + t * (curr.y - prev.y),
+                prev.z + t * (curr.z - prev.z)
+              );
+              outIdx++;
+            }
+            out[outIdx] = poly[i].clone();
+            outIdx++;
+          } else if (nv1 >= 0) {
+            var t = nv0 / (nv0 - nv1);
+            out[outIdx] = new V3(
+              prev.x + t * (curr.x - prev.x),
+              prev.y + t * (curr.y - prev.y),
+              prev.z + t * (curr.z - prev.z)
+            );
+            outIdx++;
+          }
+          nv0 = nv1;
+          nv1 = axis.dot(poly[(i + 1) % n]) - depthVal;
+        }
+      }
+
+      function boxVsBox(a, b, contacts) {
+        var Ra = qToMat(a.q);
+        var Rb = qToMat(b.q);
+        var dp = b.pos.sub(a.pos);
+
+        /* world-space half-extent vectors for each box */
+        var aAxes = [
+          new V3(Ra[0] * a.halfExtents.x, Ra[1] * a.halfExtents.x, Ra[2] * a.halfExtents.x),
+          new V3(Ra[3] * a.halfExtents.y, Ra[4] * a.halfExtents.y, Ra[5] * a.halfExtents.y),
+          new V3(Ra[6] * a.halfExtents.z, Ra[7] * a.halfExtents.z, Ra[8] * a.halfExtents.z)
+        ];
+        var bAxes = [
+          new V3(Rb[0] * b.halfExtents.x, Rb[1] * b.halfExtents.x, Rb[2] * b.halfExtents.x),
+          new V3(Rb[3] * b.halfExtents.y, Rb[4] * b.halfExtents.y, Rb[5] * b.halfExtents.y),
+          new V3(Rb[6] * b.halfExtents.z, Rb[7] * b.halfExtents.z, Rb[8] * b.halfExtents.z)
+        ];
+
+        /* 15 SAT axes — store axis, index and which body owns it */
+        var satAxes = [];
+        var i, j;
+
+        for (i = 0; i < 3; i++) {
+          satAxes.push({
+            // axis: new V3(Ra[i * 3], Ra[i * 3 + 1], Ra[i * 3 + 2]).normalize(),
+            axis: new V3(Ra[i], Ra[i + 3], Ra[i + 6]).normalize(),
+            owner: 'a',
+            face: i
+          });
+        }
+        for (i = 0; i < 3; i++) {
+          satAxes.push({
+            axis: new V3(Rb[i], Rb[i + 3], Rb[i + 6]).normalize(),
+            owner: 'b',
+            face: i
+          });
+        }
+
+        var ax, al;
+        for (i = 0; i < 3; i++) {
+          for (j = 0; j < 3; j++) {
+            ax = aAxes[i].cross(bAxes[j]);
+            al = ax.len();
+            if (al > 1e-8) {
+              satAxes.push({
+                axis: ax.mul(1 / al),
+                owner: 'edge',
+                face: -1
+              });
+            }
+          }
+        }
+
+        /* find minimum penetration axis */
+        var minPen = 1e30;
+        var bestIdx = -1;
+        var pen, rA, rB;
+
+        for (var k = 0; k < satAxes.length; k++) {
+          ax = satAxes[k].axis;
+          rA = 0;
+          rB = 0;
+          for (i = 0; i < 3; i++) {
+            rA += abs(aAxes[i].dot(ax));
+            rB += abs(bAxes[i].dot(ax));
+          }
+          pen = rA + rB - abs(dp.dot(ax));
+          if (pen < 0) return false;
+          if (pen < minPen) {
+            minPen = pen;
+            bestIdx = k;
+          }
+        }
+
+        if (bestIdx < 0) return false;
+
+        /* contact normal from a → b */
+        var normal = satAxes[bestIdx].axis.clone();
+        if (dp.dot(normal) < 0) normal = normal.negate();
+
+        /* determine reference and incident body based on the best axis owner */
+        var best = satAxes[bestIdx];
+        var refBody, incBody, refAxes, incAxes, refPos, incPos;
+        var refFaceIdx;
+
+        if (best.owner === 'a') {
+          refBody = a;
+          incBody = b;
+          refAxes = aAxes;
+          incAxes = bAxes;
+          refPos = a.pos;
+          incPos = b.pos;
+          refFaceIdx = best.face;
+        } else if (best.owner === 'b') {
+          refBody = b;
+          incBody = a;
+          refAxes = bAxes;
+          incAxes = aAxes;
+          refPos = b.pos;
+          incPos = a.pos;
+          refFaceIdx = best.face;
+          /* normal must point from a → b, so negate */
+          normal = normal.negate();
+        } else {
+          /* edge-edge — pick the face with smallest projection */
+        //   var aProj = abs(aAxes[0].dot(normal));
+        //   var bProj = abs(bAxes[0].dot(normal));
+          var aProj = Math.max(abs(aAxes[0].dot(normal)), abs(aAxes[1].dot(normal)), abs(aAxes[2].dot(normal)));
+          var bProj = Math.max(abs(bAxes[0].dot(normal)), abs(bAxes[1].dot(normal)), abs(bAxes[2].dot(normal)));
+          if (aProj > bProj) {
+            refBody = a; incBody = b;
+            refAxes = aAxes; incAxes = bAxes;
+            refPos = a.pos; incPos = b.pos;
+            refFaceIdx = -1;
+          } else {
+            refBody = b; incBody = a;
+            refAxes = bAxes; incAxes = aAxes;
+            refPos = b.pos; incPos = a.pos;
+            refFaceIdx = -1;
+            normal = normal.negate();
+          }
+        }
+
+        /* build incident face vertices in world space */
+        /* find the face of incBody most aligned with -normal */
+        var bestDot = -2;
+        var incFaceIdx = 0;
+        var incAxis, d;
+        for (i = 0; i < 3; i++) {
+          incAxis = incAxes[i].normalize();
+        //   d = abs(incAxis.dot(normal));
+          d = incAxis.dot(normal);
+          if (d > bestDot) {
+            bestDot = d;
+            incFaceIdx = i;
+          }
+        }
+
+        /* the 4 vertices of the incident face */
+        var other1 = (incFaceIdx + 1) % 3;
+        var other2 = (incFaceIdx + 2) % 3;
+        var v00 = incPos.add(incAxes[other1]).add(incAxes[other2]);
+        var v10 = incPos.sub(incAxes[other1]).add(incAxes[other2]);
+        var v11 = incPos.sub(incAxes[other1]).sub(incAxes[other2]);
+        var v01 = incPos.add(incAxes[other1]).sub(incAxes[other2]);
+
+        /* express in reference body local space */
+        // var localV00 = refBody.worldToLocal(v00);
+        // var localV10 = refBody.worldToLocal(v10);
+        // var localV11 = refBody.worldToLocal(v11);
+        // var localV01 = refBody.worldToLocal(v01);
+
+        // var incidentFace = [localV00, localV01, localV11, localV10];
+        var incidentFace = [v00, v01, v11, v10];
+
+
+        /* clip incident face against the reference face non-penetration planes */
+        var buf1 = [], buf2 = [];
+
+        if (refFaceIdx >= 0) {
+          /* face-face contact: clip against 2 reference face axes */
+          var refOther1 = (refFaceIdx + 1) % 3;
+          var refOther2 = (refFaceIdx + 2) % 3;
+
+          /* clip against first reference axis */
+          clipPolyAgainstAxis(
+            incidentFace,
+            refAxes[refOther1].normalize(),
+            refAxes[refOther1].len(),
+            buf1
+          );
+
+          /* clip against second reference axis */
+          clipPolyAgainstAxis(buf1, refAxes[refOther2].normalize(), refAxes[refOther2].len(), buf2);
+        } else {
+          /* edge-edge contact: clip against the two ref axes most perpendicular to normal */
+          /* sort ref axes by perpendicularity to normal (smallest dot = most perpendicular) */
+          var sorted = [
+            { idx: 0, dot: abs(refAxes[0].normalize().dot(normal)) },
+            { idx: 1, dot: abs(refAxes[1].normalize().dot(normal)) },
+            { idx: 2, dot: abs(refAxes[2].normalize().dot(normal)) }
+          ];
+          sorted.sort(function (x, y) { return x.dot - y.dot; });
+
+          clipPolyAgainstAxis(
+            incidentFace,
+            refAxes[sorted[0].idx].normalize(),
+            refAxes[sorted[0].idx].len(),
+            buf1
+          );
+          clipPolyAgainstAxis(
+            buf1,
+            refAxes[sorted[1].idx].normalize(),
+            refAxes[sorted[1].idx].len(),
+            buf2
+          );
+        }
+
+        /* transform clipped points back to world and create contacts */
+        var pointCount = buf2.length;
+        if (pointCount === 0) {
+          /* fallback: single contact at midpoint */
+          var c = new Contact();
+          c.pos = a.pos.add(b.pos).mul(0.5).add(normal.negate().mul(minPen * 0.5));
+          c.normal = normal;
+          c.depth = minPen;
+          c.bodyA = a;
+          c.bodyB = b;
+          contacts.push(c);
+          return true;
+        }
+
+        var sumX = 0, sumY = 0, sumZ = 0;
+        for (i = 0; i < pointCount; i++) {
+          var worldPt = refBody.localToWorld(buf2[i]);
+          sumX += worldPt.x;
+          sumY += worldPt.y;
+          sumZ += worldPt.z;
+
+          var c = new Contact();
+          c.pos = worldPt;
+          c.normal = normal.clone();
+          c.depth = minPen;
+          c.bodyA = a;
+          c.bodyB = b;
+          contacts.push(c);
+        }
+
+        return true;
+      }
+
+      function testCollision(a, b, contacts) {
+        if (a.shape === 'sphere' && b.shape === 'sphere') return sphereVsSphere(a, b, contacts);
+        if (a.shape === 'sphere' && b.shape === 'box') return sphereVsBox(a, b, contacts);
+        if (a.shape === 'box' && b.shape === 'sphere') return sphereVsBox(b, a, contacts);
+        if (a.shape === 'box' && b.shape === 'box') return boxVsBox(a, b, contacts);
+        return false;
+      }
+
+      /* ========== Broad Phase ========== */
+      function getAABB(body) {
+        if (body.shape === 'sphere') {
+          var r = body.radius;
+          var p = body.pos;
+          return {
+            lo: new V3(p.x - r, p.y - r, p.z - r),
+            hi: new V3(p.x + r, p.y + r, p.z + r)
+          };
+        }
+        var he = body.halfExtents;
+        var lo = new V3(1e9, 1e9, 1e9);
+        var hi = new V3(-1e9, -1e9, -1e9);
+        var signs = [-1, 1];
+        for (var si = 0; si < 2; si++) {
+          for (var sj = 0; sj < 2; sj++) {
+            for (var sk = 0; sk < 2; sk++) {
+              var w = body.localToWorld(
+                new V3(he.x * signs[si], he.y * signs[sj], he.z * signs[sk])
+              );
+              if (w.x < lo.x) lo.x = w.x;
+              if (w.y < lo.y) lo.y = w.y;
+              if (w.z < lo.z) lo.z = w.z;
+              if (w.x > hi.x) hi.x = w.x;
+              if (w.y > hi.y) hi.y = w.y;
+              if (w.z > hi.z) hi.z = w.z;
+            }
+          }
+        }
+        return { lo: lo, hi: hi };
+      }
+
+      function expandAABB(aabb, vel, dt) {
+        var dx = abs(vel.x) * dt;
+        var dy = abs(vel.y) * dt;
+        var dz = abs(vel.z) * dt;
+        var lo = aabb.lo.clone();
+        var hi = aabb.hi.clone();
+        lo.x -= dx;
+        lo.y -= dy;
+        lo.z -= dz;
+        hi.x += dx;
+        hi.y += dy;
+        hi.z += dz;
+        return { lo: lo, hi: hi };
+      }
+
+      function overlap(a, b) {
+        return (
+          a.lo.x <= b.hi.x && a.hi.x >= b.lo.x &&
+          a.lo.y <= b.hi.y && a.hi.y >= b.lo.y &&
+          a.lo.z <= b.hi.z && a.hi.z >= b.lo.z
+        );
+      }
+
+      /* ========== Physics World ========== */
+      var GRAVITY = new V3(0, -9.81, 0);
+      var CORRECTION = 0.1;
+      var SLOP = 0.005;
+      var SLEEP_THRESHOLD = 0.0005;
+      var SLEEP_TIME = 3.0;
+
+      function PhysicsWorld() {
+        this.bodies = [];
+        this.contacts = [];
+        this._nextId = 0;
+      }
+
+      PhysicsWorld.prototype.addBody = function (b) {
+        b.id = this._nextId++;
+        this.bodies.push(b);
+        return b;
+      };
+
+      PhysicsWorld.prototype.removeBody = function (b) {
+        var i = this.bodies.indexOf(b);
+        if (i >= 0) this.bodies.splice(i, 1);
+      };
+
+      PhysicsWorld.prototype.step = function (dt) {
+        var subDt = dt / 8;
+        for (var s = 0; s < 8; s++) {
+          this.integrate(subDt);
+          this.findContacts(subDt);
+          this.solveConstraints(10);
+        }
+        this.updateSleep(dt);
+      };
+
+      PhysicsWorld.prototype.integrate = function (dt) {
+        var b, bodyAngVel, angSpeed, halfAngle, dqSin, dq;
+        for (var i = 0; i < this.bodies.length; i++) {
+          b = this.bodies[i];
+          if (b.type === 'static' || b.sleeping) continue;
+
+          /* apply gravity */
+          b.vel.y += GRAVITY.y * dt;
+
+          /* integrate position */
+          b.pos.x += b.vel.x * dt;
+          b.pos.y += b.vel.y * dt;
+          b.pos.z += b.vel.z * dt;
+
+          /* integrate rotation */
+          bodyAngVel = b.bodyAngVel();
+          angSpeed = bodyAngVel.len();
+          if (angSpeed > 1e-9) {
+            halfAngle = angSpeed * dt * 0.5;
+            dqSin = sin(halfAngle) / angSpeed;
+            dq = new Q();
+            dq.x = bodyAngVel.x * dqSin;
+            dq.y = bodyAngVel.y * dqSin;
+            dq.z = bodyAngVel.z * dqSin;
+            dq.w = cos(halfAngle);
+            b.q.multiply(dq).normalize();
+          }
+
+          /* damping */
+          b.vel.x *= 0.998;
+          b.vel.y *= 0.998;
+          b.vel.z *= 0.998;
+          b.angVel.x *= 0.99;
+          b.angVel.y *= 0.99;
+          b.angVel.z *= 0.99;
+
+          /* velocity clamp */
+          var vlen = b.vel.len();
+          if (vlen > 50) { b.vel = b.vel.mul(50 / vlen); }
+
+          var wlen = b.angVel.len();
+          if (wlen > 30) { b.angVel = b.angVel.mul(30 / wlen); }
+        }
+      };
+
+      PhysicsWorld.prototype.findContacts = function (dt) {
+        this.contacts = [];
+        var n = this.bodies.length;
+        var a, b, aABB, bABB;
+
+        for (var i = 0; i < n; i++) {
+          a = this.bodies[i];
+          aABB = a.type === 'dynamic'
+            ? expandAABB(getAABB(a), a.vel, dt)
+            : getAABB(a);
+
+          for (var j = i + 1; j < n; j++) {
+            b = this.bodies[j];
+            if (a.type === 'static' && b.type === 'static') continue;
+            bABB = b.type === 'dynamic'
+              ? expandAABB(getAABB(b), b.vel, dt)
+              : getAABB(b);
+            if (!overlap(aABB, bABB)) continue;
+            testCollision(a, b, this.contacts);
+          }
+        }
+      };
+
+      PhysicsWorld.prototype.solveConstraints = function (iterations) {
+        var it, ci, c;
+        // console.log('Solving ' + this.contacts.length + ' contacts');
+        for (it = 0; it < iterations; it++) {
+          for (ci = 0; ci < this.contacts.length; ci++) {
+            c = this.contacts[ci];
+            this.resolveContact(c);
+          }
+        }
+      };
+
+      PhysicsWorld.prototype.resolveContact = function (c) {
+        var a = c.bodyA;
+        var b = c.bodyB;
+        var n = c.normal;
+        var flip = c.flipImpulse || false;
+        var ra = c.pos.sub(a.pos);
+        var rb = c.pos.sub(b.pos);
+
+        /* relative velocity at contact point */
+        var velA = a.vel.add(a.angVel.cross(ra));
+        var velB = b.vel.add(b.angVel.cross(rb));
+        var relVel = velB.sub(velA);
+        var velAlongNormal = relVel.dot(n);
+
+        /* skip if separating (flip check when normal points B→A) */
+        if (flip) {
+          if (velAlongNormal < 0) return;
+        } else {
+          if (velAlongNormal > 0) return;
+        }
+
+        /* effective mass */
+        var rACrossN = ra.cross(n);
+        var rBCrossN = rb.cross(n);
+        var invEffectiveMass = a.invMass + b.invMass;
+
+        if (a.type === 'dynamic') {
+          var MiA = a.getWorldInvI();
+          var angularContribA = matVec(MiA, rACrossN);
+          invEffectiveMass += rACrossN.dot(angularContribA);
+        }
+        if (b.type === 'dynamic') {
+          var MiB = b.getWorldInvI();
+          var angularContribB = matVec(MiB, rBCrossN);
+          invEffectiveMass += rBCrossN.dot(angularContribB);
+        }
+
+        if (invEffectiveMass < 1e-10) return;
+        var effectiveMass = 1 / invEffectiveMass;
+
+        /* normal impulse */
+        var restitution = min(a.restitution, b.restitution);
+        var impulse;
+
+        if (abs(velAlongNormal) < 0.05 && c.depth < 0.01) {
+          impulse = -velAlongNormal * effectiveMass;
+        } else {
+          impulse = -(1 + restitution) * velAlongNormal * effectiveMass;
+        }
+
+        var impulseVec = n.mul(impulse);
+
+        /* apply impulse — swap A/B directions when normal points B→A */
+        if (a.type === 'dynamic') {
+          if (flip) {
+            a.vel.x += impulseVec.x * a.invMass;
+            a.vel.y += impulseVec.y * a.invMass;
+            a.vel.z += impulseVec.z * a.invMass;
+            var angularImpA = ra.cross(impulseVec);
+            var MiA2 = a.getWorldInvI();
+            var deltaOmegaA = matVec(MiA2, angularImpA);
+            a.angVel.x += deltaOmegaA.x;
+            a.angVel.y += deltaOmegaA.y;
+            a.angVel.z += deltaOmegaA.z;
+          } else {
+            a.vel.x -= impulseVec.x * a.invMass;
+            a.vel.y -= impulseVec.y * a.invMass;
+            a.vel.z -= impulseVec.z * a.invMass;
+            var angularImpA = ra.cross(impulseVec);
+            var MiA2 = a.getWorldInvI();
+            var deltaOmegaA = matVec(MiA2, angularImpA);
+            a.angVel.x -= deltaOmegaA.x;
+            a.angVel.y -= deltaOmegaA.y;
+            a.angVel.z -= deltaOmegaA.z;
+          }
+          if (a.sleeping) { a.sleeping = false; a.sleepTimer = 0; }
+        }
+
+        if (b.type === 'dynamic') {
+          if (flip) {
+            b.vel.x -= impulseVec.x * b.invMass;
+            b.vel.y -= impulseVec.y * b.invMass;
+            b.vel.z -= impulseVec.z * b.invMass;
+            var angularImpB = rb.cross(impulseVec);
+            var MiB2 = b.getWorldInvI();
+            var deltaOmegaB = matVec(MiB2, angularImpB);
+            b.angVel.x -= deltaOmegaB.x;
+            b.angVel.y -= deltaOmegaB.y;
+            b.angVel.z -= deltaOmegaB.z;
+          } else {
+            b.vel.x += impulseVec.x * b.invMass;
+            b.vel.y += impulseVec.y * b.invMass;
+            b.vel.z += impulseVec.z * b.invMass;
+            var angularImpB = rb.cross(impulseVec);
+            var MiB2 = b.getWorldInvI();
+            var deltaOmegaB = matVec(MiB2, angularImpB);
+            b.angVel.x += deltaOmegaB.x;
+            b.angVel.y += deltaOmegaB.y;
+            b.angVel.z += deltaOmegaB.z;
+          }
+          if (b.sleeping) { b.sleeping = false; b.sleepTimer = 0; }
+        }
+
+        /* friction */
+        var tangent = relVel.sub(n.mul(velAlongNormal));
+        var tangentLen = tangent.len();
+
+        if (tangentLen > 1e-8) {
+          var t = tangent.mul(1 / tangentLen);
+          var raCrossT = ra.cross(t);
+          var rbCrossT = rb.cross(t);
+          var invEffMassT = a.invMass + b.invMass;
+
+          if (a.type === 'dynamic') {
+            var MiAT = a.getWorldInvI();
+            invEffMassT += raCrossT.dot(matVec(MiAT, raCrossT));
+          }
+          if (b.type === 'dynamic') {
+            var MiBT = b.getWorldInvI();
+            invEffMassT += rbCrossT.dot(matVec(MiBT, rbCrossT));
+          }
+
+          if (invEffMassT > 1e-10) {
+            var effMassT = 1 / invEffMassT;
+            var frictionImpulse = -relVel.dot(t) * effMassT;
+            var mu = (a.friction + b.friction) * 0.5;
+
+            if (abs(frictionImpulse) > abs(impulse) * mu) {
+              frictionImpulse = abs(impulse) * mu * (frictionImpulse > 0 ? 1 : -1);
+            }
+
+            var frictionVec = t.mul(frictionImpulse);
+
+            if (a.type === 'dynamic') {
+              if (flip) {
+                a.vel.x += frictionVec.x * a.invMass;
+                a.vel.y += frictionVec.y * a.invMass;
+                a.vel.z += frictionVec.z * a.invMass;
+                var dwA = matVec(a.getWorldInvI(), ra.cross(frictionVec));
+                a.angVel.x += dwA.x;
+                a.angVel.y += dwA.y;
+                a.angVel.z += dwA.z;
+              } else {
+                a.vel.x -= frictionVec.x * a.invMass;
+                a.vel.y -= frictionVec.y * a.invMass;
+                a.vel.z -= frictionVec.z * a.invMass;
+                var dwA = matVec(a.getWorldInvI(), ra.cross(frictionVec));
+                a.angVel.x -= dwA.x;
+                a.angVel.y -= dwA.y;
+                a.angVel.z -= dwA.z;
+              }
+              if (a.sleeping) { a.sleeping = false; a.sleepTimer = 0; }
+            }
+
+            if (b.type === 'dynamic') {
+              if (flip) {
+                b.vel.x -= frictionVec.x * b.invMass;
+                b.vel.y -= frictionVec.y * b.invMass;
+                b.vel.z -= frictionVec.z * b.invMass;
+                var dwB = matVec(b.getWorldInvI(), rb.cross(frictionVec));
+                b.angVel.x -= dwB.x;
+                b.angVel.y -= dwB.y;
+                b.angVel.z -= dwB.z;
+              } else {
+                b.vel.x += frictionVec.x * b.invMass;
+                b.vel.y += frictionVec.y * b.invMass;
+                b.vel.z += frictionVec.z * b.invMass;
+                var dwB = matVec(b.getWorldInvI(), rb.cross(frictionVec));
+                b.angVel.x += dwB.x;
+                b.angVel.y += dwB.y;
+                b.angVel.z += dwB.z;
+              }
+              if (b.sleeping) { b.sleeping = false; b.sleepTimer = 0; }
+            }
+          }
+        }
+
+        /* positional correction — swap A/B when normal points B→A */
+        var correctionDist = max(c.depth - SLOP, 0) * CORRECTION / (a.invMass + b.invMass);
+        var correction = n.mul(correctionDist);
+
+        if (a.type === 'dynamic') {
+          if (flip) {
+            a.pos.x += correction.x * a.invMass;
+            a.pos.y += correction.y * a.invMass;
+            a.pos.z += correction.z * a.invMass;
+          } else {
+            a.pos.x -= correction.x * a.invMass;
+            a.pos.y -= correction.y * a.invMass;
+            a.pos.z -= correction.z * a.invMass;
+          }
+          if (a.sleeping && correctionDist > 0.001) {
+            a.sleeping = false;
+            a.sleepTimer = 0;
+          }
+        }
+
+        if (b.type === 'dynamic') {
+          if (flip) {
+            b.pos.x -= correction.x * b.invMass;
+            b.pos.y -= correction.y * b.invMass;
+            b.pos.z -= correction.z * b.invMass;
+          } else {
+            b.pos.x += correction.x * b.invMass;
+            b.pos.y += correction.y * b.invMass;
+            b.pos.z += correction.z * b.invMass;
+          }
+          if (b.sleeping && correctionDist > 0.001) {
+            b.sleeping = false;
+            b.sleepTimer = 0;
+          }
+        }
+        // console.log('contact resolved', impulse, frictionImpulse);
+        // // console.log('a.velocity', a.vel, a.angVel);
+        // console.log('c.pos, b.pos', c.pos, c.normal, b.pos);
+        // console.log('a.invMass, b.invMass', a.invMass, b.invMass);
+        // console.log('b.velocity', b.vel, b.angVel);
+      };
+
+      PhysicsWorld.prototype.updateSleep = function (dt) {
+        var b, velSq;
+        for (var i = 0; i < this.bodies.length; i++) {
+          b = this.bodies[i];
+          if (b.type === 'static') continue;
+          velSq = b.vel.lenSq() + b.angVel.lenSq();
+          if (velSq < SLEEP_THRESHOLD) {
+            b.sleepTimer += dt;
+            if (b.sleepTimer > SLEEP_TIME) b.sleeping = true;
+          } else {
+            b.sleepTimer = 0;
+            b.sleeping = false;
+          }
+        }
+      };
+
+      /* ========== Three.js Setup ========== */
+      var scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x1a1a2e);
+      scene.fog = new THREE.FogExp2(0x1a1a2e, 0.012);
+
+      var camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
+      camera.position.set(15, 12, 18);
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.setPixelRatio(min(devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      document.body.appendChild(renderer.domElement);
+
+      var controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.06;
+      controls.target.set(0, 2, 0);
+      controls.maxPolarAngle = PI * 0.48;
+      controls.minDistance = 5;
+      controls.maxDistance = 60;
+
+      scene.add(new THREE.AmbientLight(0x404060, 0.8));
+
+      var sun = new THREE.DirectionalLight(0xfff5e0, 1.8);
+      sun.position.set(12, 25, 12);
+      sun.castShadow = true;
+      sun.shadow.mapSize.set(2048, 2048);
+      sun.shadow.camera.left = -20;
+      sun.shadow.camera.right = 20;
+      sun.shadow.camera.top = 20;
+      sun.shadow.camera.bottom = -20;
+      sun.shadow.camera.near = 1;
+      sun.shadow.camera.far = 60;
+      sun.shadow.bias = -0.0005;
+      scene.add(sun);
+
+      var fill = new THREE.DirectionalLight(0x8888ff, 0.3);
+      fill.position.set(-8, 12, -8);
+      scene.add(fill);
+
+      var groundMesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(60, 60),
+        new THREE.MeshStandardMaterial({ color: 0x2a2a3e, roughness: 0.9 })
+      );
+      groundMesh.rotation.x = -PI / 2;
+      groundMesh.receiveShadow = true;
+      scene.add(groundMesh);
+      scene.add(new THREE.GridHelper(60, 30, 0x3a3a5e, 0x252545));
+
+      /* ========== Physics Scene ========== */
+      var phys = new PhysicsWorld();
+      var meshMap = new Map();
+
+      /* ground body */
+      phys.addBody(new Body({
+        type: 'static',
+        shape: 'box',
+        x: 0, y: -0.25, z: 0,
+        hx: 30, hy: 0.25, hz: 30,
+        color: 0x3a3a5e
+      }));
+
+      /* walls */
+      function addWall(x, y, z, hx, hy, hz) {
+        var w = new Body({
+          type: 'static',
+          shape: 'box',
+          x: x, y: y, z: z,
+          hx: hx, hy: hy, hz: hz,
+          color: 0x2a2a4e
+        });
+        phys.addBody(w);
+        var m = createMesh(w);
+        m.material.transparent = true;
+        m.material.opacity = 0.15;
+      }
+
+      // addWall(0, 2.5, -12, 14, 5, 0.3);
+      // addWall(-12, 2.5, 0, 0.3, 5, 24);
+      // addWall(12, 2.5, 0, 0.3, 5, 24);
+
+      function createMesh(body) {
+        var geo;
+        if (body.shape === 'box') {
+          geo = new THREE.BoxGeometry(
+            body.halfExtents.x * 2,
+            body.halfExtents.y * 2,
+            body.halfExtents.z * 2
+          );
+        } else {
+          geo = new THREE.SphereGeometry(body.radius, 20, 20);
+        }
+
+        var mat = new THREE.MeshStandardMaterial({
+          color: body.color,
+          roughness: body.shape === 'sphere' ? 0.25 : 0.5,
+          metalness: 0.1
+        });
+
+        var mesh = new THREE.Mesh(geo, mat);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        scene.add(mesh);
+        meshMap.set(body.id, mesh);
+        return mesh;
+      }
+
+      function updateVisual(body) {
+        var m = meshMap.get(body.id);
+        if (!m) return;
+        m.position.set(body.pos.x, body.pos.y, body.pos.z);
+        m.quaternion.set(body.q.x, body.q.y, body.q.z, body.q.w);
+      }
+
+      function removeVisual(body) {
+        var m = meshMap.get(body.id);
+        if (m) {
+          scene.remove(m);
+          m.geometry.dispose();
+          m.material.dispose();
+          meshMap.delete(body.id);
+        }
+      }
+
+      var PALETTE = [
+        0xe74c3c, 0xe67e22, 0xf39c12, 0x2ecc71,
+        0x1abc9c, 0x3498db, 0x9b59b6, 0xe91e63,
+        0x00bcd4, 0xff9800, 0x8bc34a, 0xff5722,
+        0x673ab7, 0x03a9f4, 0x4caf50, 0xcddc39,
+        0x795548, 0x607d8b
+      ];
+
+      function rndColor() {
+        return PALETTE[Math.floor(random() * PALETTE.length)];
+      }
+
+      var totalCount = 1;
+
+      function buildScene() {
+        var dynamicBodies = phys.bodies.filter(function (b) {
+          return b.type !== 'static';
+        });
+        for (var i = 0; i < dynamicBodies.length; i++) {
+          removeVisual(dynamicBodies[i]);
+          phys.removeBody(dynamicBodies[i]);
+        }
+        totalCount = phys.bodies.length;
+
+        /* pyramid */
+        var size = 0.6;
+        var layers = 8;
+
+        // for (var L = 0; L < layers && totalCount < 1900; L++) {
+        //   var layerSize = 6 - L;
+        //   var y = size * 0.5 + L * size;
+        //   var offset = (layerSize - 1) * size * 0.5;
+
+        //   for (var i = 0; i < layerSize && totalCount < 1900; i++) {
+        //     for (var j = 0; j < layerSize && totalCount < 1900; j++) {
+        //       var b = new Body({
+        //         shape: 'box',
+        //         x: i * size - offset,
+        //         y: y,
+        //         z: j * size - offset,
+        //         hx: size * 0.5,
+        //         hy: size * 0.5,
+        //         hz: size * 0.5,
+        //         mass: 1,
+        //         restitution: 0.08,
+        //         friction: 0.7,
+        //         color: rndColor()
+        //       });
+        //       phys.addBody(b);
+        //       createMesh(b);
+        //       totalCount++;
+        //     }
+        //   }
+        // }
+
+        /* falling blocks */
+        for (var k = 0; k < 1 && totalCount < 2000; k++) {
+          var b = new Body({
+            shape: 'box',
+            x: (random() - 0.5) * 6,
+            y: 6 + random() * 4,
+            z: (random() - 0.5) * 6,
+            hx: 0.2 + random() * 0.25,
+            hy: 0.2 + random() * 0.25,
+            hz: 0.2 + random() * 0.25,
+            mass: 0.5 + random(),
+            restitution: 0.05,
+            friction: 0.5,
+            color: rndColor(),
+            angVx: random() * 2 - 1,
+            angVy: random() * 2 - 1,
+            angVz: random() * 2 - 1
+          });
+          phys.addBody(b);
+          createMesh(b);
+          totalCount++;
+        }
+      }
+
+      buildScene();
+
+      /* Shoot */
+      function shootBall() {
+        if (totalCount >= 2000) return;
+
+        var dir = new THREE.Vector3();
+        camera.getWorldDirection(dir);
+        var speed = 20;
+
+        var b = new Body({
+          shape: 'sphere',
+          x: camera.position.x + dir.x * 3,
+          y: camera.position.y + dir.y * 3,
+          z: camera.position.z + dir.z * 3,
+          radius: 0.4,
+          vx: dir.x * speed,
+          vy: dir.y * speed,
+          vz: dir.z * speed,
+          mass: 5,
+          restitution: 0.3,
+          friction: 0.5,
+          color: 0xffcc00
+        });
+
+        phys.addBody(b);
+        createMesh(b);
+        totalCount++;
+
+        while (totalCount > 2000) {
+          var old = phys.bodies.find(function (x) {
+            return x.type === 'dynamic';
+          });
+          if (old) {
+            removeVisual(old);
+            phys.removeBody(old);
+            totalCount--;
+          } else {
+            break;
+          }
+        }
+      }
+
+      renderer.domElement.addEventListener('click', shootBall);
+
+      window.addEventListener('keydown', function (e) {
+        if (e.code === 'Space') {
+          e.preventDefault();
+          shootBall();
+        }
+        if (e.code === 'KeyR') {
+          buildScene();
+        }
+      });
+
+      var tStart = 0;
+      renderer.domElement.addEventListener('touchstart', function () {
+        tStart = Date.now();
+      });
+      renderer.domElement.addEventListener('touchend', function () {
+        if (Date.now() - tStart < 300) shootBall();
+      });
+
+      window.addEventListener('resize', function () {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+
+      /* ========== Main Loop ========== */
+      var clock = new THREE.Clock();
+      var statsEl = document.getElementById('stats');
+      var fpsFrames = 0;
+      var fpsAccum = 0;
+      var fps = 0;
+
+      function animate() {
+        requestAnimationFrame(animate);
+
+        var dt = min(clock.getDelta(), 1 / 30);
+        fpsFrames++;
+        fpsAccum += dt;
+
+        if (fpsAccum >= 0.5) {
+          fps = Math.round(fpsFrames / fpsAccum);
+          fpsFrames = 0;
+          fpsAccum = 0;
+        }
+
+        phys.step(dt);
+
+        for (var i = 0; i < phys.bodies.length; i++) {
+          var b = phys.bodies[i];
+          if (b.type !== 'static') updateVisual(b);
+        }
+
+        controls.update();
+        renderer.render(scene, camera);
+        statsEl.innerHTML = 'FPS: ' + fps + '<br>Bodies: ' + phys.bodies.length + '<br>Contacts: ' + phys.contacts.length;
+      }
+
+      animate();
+
+    })();
+  </script>
+</body>
+</html>
