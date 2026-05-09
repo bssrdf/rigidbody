@@ -77,6 +77,10 @@ const gridH = new THREE.GridHelper(60, 30, 0x333355, 0x222240);
 gridH.position.set(0, 0.01, 0);
 scene.add(gridH);
 
+/* ── CONTACT DEBUG GROUP ──────────────────────────── */
+const contactGroup = new THREE.Group();
+scene.add(contactGroup);
+
 /* ── CONSTANTS ─────────────────────────────────────── */
 const GRAVITY = -20;
 const SUBSTEPS = 20;
@@ -475,9 +479,10 @@ class Grid {
   }
 }
 const g = new Grid(2);
+let _lastManifolds = [];
 
 /* ── PHYSICS STEP ────────────────────────────────── */
-function step(dt) {
+function step(dt, s) {
   // 1. Integrate
   for (const b of bodies) {
     if (b.isStatic) continue;
@@ -512,7 +517,10 @@ function step(dt) {
       if (seen.has(key)) continue;
       seen.add(key);
       const man = satOBB(a, b);
-      if (man) resolve(a, b, man);
+      if (man) {
+        resolve(a, b, man);
+        if (s === SUBSTEPS - 1) _lastManifolds.push(man);
+      }
     }
   }
 
@@ -541,6 +549,40 @@ function step(dt) {
   }
 }
 
+/* ── DRAW CONTACTS (ported from boxbox.html) ─────── */
+const _sphGeo = new THREE.SphereGeometry(0.06, 8, 8);
+const _sphMat = new THREE.MeshBasicMaterial({ color: 0xff2222 });
+
+function drawContacts(manifolds) {
+  while (contactGroup.children.length) {
+    const child = contactGroup.children[0];
+    contactGroup.remove(child);
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) child.material.dispose();
+  }
+  for (const man of manifolds) {
+    const centroid = new THREE.Vector3();
+    man.contacts.forEach(c => centroid.add(c.position));
+    centroid.divideScalar(man.contacts.length);
+    const arrow = new THREE.ArrowHelper(man.normal, centroid, 1.2, 0xffff00, 0.22, 0.14);
+    contactGroup.add(arrow);
+    for (const c of man.contacts) {
+      const s = new THREE.Mesh(_sphGeo, _sphMat);
+      s.position.copy(c.position);
+      contactGroup.add(s);
+      const end = c.position.clone().addScaledVector(man.normal, -c.depth);
+      const lg = new THREE.BufferGeometry().setFromPoints([c.position, end]);
+      contactGroup.add(new THREE.Line(lg, new THREE.LineBasicMaterial({ color: 0x00ff66 })));
+    }
+    if (man.contacts.length >= 3) {
+      const pts = man.contacts.map(c => c.position);
+      pts.push(pts[0]);
+      const lg = new THREE.BufferGeometry().setFromPoints(pts);
+      contactGroup.add(new THREE.Line(lg, new THREE.LineBasicMaterial({ color: 0xff22ff })));
+    }
+  }
+}
+
 /* ── RENDER ──────────────────────────────────────── */
 const clock = new THREE.Clock();
 let fc=0, ft=0;
@@ -554,7 +596,10 @@ function animate() {
   if (ft >= 0.5) { fpsEl.textContent = Math.round(fc/ft); fc=0; ft=0; }
 
   const subDt = dt / SUBSTEPS;
-  for (let s = 0; s < SUBSTEPS; s++) step(subDt);
+  _lastManifolds = [];
+  for (let s = 0; s < SUBSTEPS; s++) step(subDt, s);
+
+  drawContacts(_lastManifolds);
 
   for (const b of bodies) {
     b.mesh.position.copy(b.pos);
