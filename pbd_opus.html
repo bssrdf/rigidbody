@@ -183,153 +183,265 @@ for (const n of [6,5,5,4,4,3,2,2,1,1])
   for (let i=0;i<n&&idx<30;i++,idx++)
     spawnBlock((Math.random()-.5)*6, 4+idx*1.4, (Math.random()-.5)*3, 0.5+Math.random()*0.6);
 
-/* ── SAT OBB vs OBB ──────────────────────────────── */
+/* ── SAT OBB vs OBB (Gottschalk — up to 4 contacts) ── */
+const SAT_EPS = 1e-6;
+
 function satOBB(a, b) {
-  const A = a.aabb(), B = b.aabb();
-  const rel = B.center.clone().sub(A.center);
-  const axes = [...A.dirs, ...B.dirs];
-  for (let i=0;i<3;i++) for (let j=0;j<3;j++) {
-    const c = A.dirs[i].clone().cross(B.dirs[j]);
-    if (c.lengthSq()>1e-8) { c.normalize(); axes.push(c); }
+  const hwA=a.w/2, hhA=a.h/2, hdA=a.d/2;
+  const hwB=b.w/2, hhB=b.h/2, hdB=b.d/2;
+  const hA=[hwA,hhA,hdA], hB=[hwB,hhB,hdB];
+
+  const axesA = [new THREE.Vector3(1,0,0),new THREE.Vector3(0,1,0),new THREE.Vector3(0,0,1)]
+    .map(v=>v.clone().applyQuaternion(a.quat));
+  const axesB = [new THREE.Vector3(1,0,0),new THREE.Vector3(0,1,0),new THREE.Vector3(0,0,1)]
+    .map(v=>v.clone().applyQuaternion(b.quat));
+
+  // R matrix — reused across all 15 axis tests
+  const R=[[0,0,0],[0,0,0],[0,0,0]], AbsR=[[0,0,0],[0,0,0],[0,0,0]];
+  for(let i=0;i<3;i++) for(let j=0;j<3;j++){
+    R[i][j]=axesA[i].dot(axesB[j]); AbsR[i][j]=Math.abs(R[i][j])+SAT_EPS;
   }
-  let minD=1e9, minA=null;
-  for (const ax of axes) {
-    const t = rel.dot(ax);
-    let ra=0, rb=0;
-    for (let i=0;i<3;i++) {
-      ra += Math.abs(A.dirs[i].dot(ax))*A.exts[i];
-      rb += Math.abs(B.dirs[i].dot(ax))*B.exts[i];
-    }
-    const overlap = ra+rb-Math.abs(t);
-    if (overlap < -1e-6) return null;
-    if (overlap < minD) {
-      minD = overlap;
-      minA = t < 0 ? ax.clone().negate() : ax.clone();
+
+  const t = new THREE.Vector3().subVectors(b.pos, a.pos);
+  const tA = new THREE.Vector3(t.dot(axesA[0]),t.dot(axesA[1]),t.dot(axesA[2]));
+  const tB = new THREE.Vector3(t.dot(axesB[0]),t.dot(axesB[1]),t.dot(axesB[2]));
+
+  let bestPen=Infinity, bestAxis=new THREE.Vector3(), bestCase=-1, bestI=0, bestJ=0;
+
+  function test(L,pen,cid,i,j,biasFace){
+    const biased=biasFace?pen:pen+1e-4;           // face bias
+    if(biased<bestPen){
+      bestPen=biased; bestAxis.copy(L);
+      if(L.dot(t)<0) bestAxis.negate();
+      bestCase=cid; bestI=i; bestJ=j;
     }
   }
-  if (!minA || minD < -1e-6) return null;
-  return {
-    normal: minA,
-    depth: minD,
-    contact: A.center.clone().add(minA.clone().multiplyScalar(minD*0.5))
-  };
+
+  // Face axes of A
+  for(let i=0;i<3;i++){
+    const rA=hA[i], rB=hB[0]*AbsR[i][0]+hB[1]*AbsR[i][1]+hB[2]*AbsR[i][2];
+    const pen=rA+rB-Math.abs(tA.getComponent(i));
+    if(pen<0) return null;
+    test(axesA[i],pen,i,i,0,true);
+  }
+  // Face axes of B
+  for(let j=0;j<3;j++){
+    const rA=hA[0]*AbsR[0][j]+hA[1]*AbsR[1][j]+hA[2]*AbsR[2][j], rB=hB[j];
+    const pen=rA+rB-Math.abs(tB.getComponent(j));
+    if(pen<0) return null;
+    test(axesB[j],pen,3+j,0,j,true);
+  }
+  // Edge-edge axes (Gottschalk)
+  for(let i=0;i<3;i++) for(let j=0;j<3;j++){
+    const L=new THREE.Vector3().crossVectors(axesA[i],axesB[j]);
+    const len2=L.lengthSq(); if(len2<1e-8) continue;
+    L.multiplyScalar(1/Math.sqrt(len2));
+    const i1=(i+1)%3,i2=(i+2)%3,j1=(j+1)%3,j2=(j+2)%3;
+    const rA=hA[i1]*AbsR[i2][j]+hA[i2]*AbsR[i1][j];
+    const rB=hB[j1]*AbsR[i][j2]+hB[j2]*AbsR[i][j1];
+    const dist=Math.abs(tA.getComponent(i2)*R[i1][j]-tA.getComponent(i1)*R[i2][j]);
+    const pen=rA+rB-dist;
+    if(pen<0) return null;
+    test(L,pen,6+i*3+j,i,j,false);
+  }
+
+  if(bestCase<0) return null;
+  if(bestCase>=6)
+    return edgeEdgeContact(a,b,axesA,axesB,hA,hB,bestI,bestJ,bestAxis,bestPen);
+  return faceContact(a,b,axesA,axesB,hA,hB,bestAxis,bestPen,bestCase<3);
 }
 
-/* ── IMPULSE RESOLUTION ──────────────────────────── */
+/* ── edge-edge: closest pts on two segments ─────── */
+function supportEdge(pos,axes,h,axisIdx,dir){
+  const i1=(axisIdx+1)%3, i2=(axisIdx+2)%3;
+  const s1=Math.sign(axes[i1].dot(dir))||1, s2=Math.sign(axes[i2].dot(dir))||1;
+  const base=new THREE.Vector3().copy(pos)
+    .addScaledVector(axes[i1],s1*h[i1]).addScaledVector(axes[i2],s2*h[i2]);
+  return [base.clone().addScaledVector(axes[axisIdx],-h[axisIdx]),
+          base.clone().addScaledVector(axes[axisIdx], h[axisIdx])];
+}
+
+function closestPointsOnSegments(p1,p2,p3,p4){
+  const d1=new THREE.Vector3().subVectors(p2,p1);
+  const d2=new THREE.Vector3().subVectors(p4,p3);
+  const r=new THREE.Vector3().subVectors(p1,p3);
+  const a=d1.dot(d1),e=d2.dot(d2),f=d2.dot(r);
+  let s,t;
+  if(a<=SAT_EPS&&e<=SAT_EPS) return{a:p1.clone(),b:p3.clone()};
+  if(a<=SAT_EPS){s=0;t=THREE.MathUtils.clamp(f/e,0,1);}else{
+    const c=d1.dot(r);
+    if(e<=SAT_EPS){t=0;s=THREE.MathUtils.clamp(-c/a,0,1);}else{
+      const b=d1.dot(d2),den=a*e-b*b;
+      s=den!==0?THREE.MathUtils.clamp((b*f-c*e)/den,0,1):0;
+      t=(b*s+f)/e;
+      if(t<0){t=0;s=THREE.MathUtils.clamp(-c/a,0,1);}else if(t>1){t=1;s=THREE.MathUtils.clamp((b-c)/a,0,1);}
+    }
+  }
+  return{a:p1.clone().addScaledVector(d1,s),b:p3.clone().addScaledVector(d2,t)};
+}
+
+function edgeEdgeContact(bodyA,bodyB,axesA,axesB,hA,hB,iA,iB,normal,depth){
+  const eA=supportEdge(bodyA.pos,axesA,hA,iA,normal);
+  const eB=supportEdge(bodyB.pos,axesB,hB,iB,normal.clone().negate());
+  const p=closestPointsOnSegments(eA[0],eA[1],eB[0],eB[1]);
+  const c=new THREE.Vector3().addVectors(p.a,p.b).multiplyScalar(0.5);
+  return{normal:normal.clone(),depth,contacts:[{position:c,depth}]};
+}
+
+/* ── face contact: Sutherland–Hodgman clipping ──── */
+function faceContact(bodyA,bodyB,axesA,axesB,hA,hB,normal,depth,refIsA){
+  const refAxes=refIsA?axesA:axesB, incAxes=refIsA?axesB:axesA;
+  const refH=refIsA?hA:hB,       incH=refIsA?hB:hA;
+  const refPos=refIsA?bodyA.pos:bodyB.pos, incPos=refIsA?bodyB.pos:bodyA.pos;
+  const refN=refIsA?normal.clone():normal.clone().negate();
+
+  const refFace=getSupportFace(refPos,refAxes,refH,refN);
+  const incFace=getSupportFace(incPos,incAxes,incH,refN.clone().negate());
+
+  let poly=incFace.vertices;
+  for(const pl of refFace.sidePlanes){
+    poly=clipPolygonAgainstPlane(poly,pl.normal,pl.offset);
+    if(poly.length===0) return{normal:normal.clone(),depth,contacts:[{position:refFace.vertices[0].clone(),depth}]};
+  }
+
+  const refD=refFace.normal.dot(refFace.vertices[0]);
+  const contacts=[];
+  for(const p of poly){
+    const d=refFace.normal.dot(p)-refD;
+    if(d<=SAT_EPS){
+      const proj=p.clone().addScaledVector(refFace.normal,-d);
+      contacts.push({position:proj,depth:-d});
+    }
+  }
+  if(contacts.length===0) return{normal:normal.clone(),depth,contacts:[{position:refFace.vertices[0].clone(),depth}]};
+
+  return{normal:normal.clone(),depth,contacts:reduceManifold(contacts,refIsA?normal: normal.clone().negate())};
+}
+
+function getSupportFace(center,axes,h,dir){
+  let ba=0,bd=-Infinity,bs=1;
+  for(let i=0;i<3;i++){const d=axes[i].dot(dir);if(Math.abs(d)>bd){bd=Math.abs(d);ba=i;bs=d>=0?1:-1;}}
+  const a=ba, u=(a+1)%3, v=(a+2)%3;
+  const fc=center.clone().addScaledVector(axes[a],bs*h[a]);
+  const eu=axes[u].clone().multiplyScalar(h[u]), ev=axes[v].clone().multiplyScalar(h[v]);
+  const verts=[fc.clone().sub(eu).sub(ev),fc.clone().add(eu).sub(ev),fc.clone().add(eu).add(ev),fc.clone().sub(eu).add(ev)];
+  const sidePlanes=[
+    {normal:axes[u].clone(),            offset: axes[u].dot(fc)+h[u]},
+    {normal:axes[u].clone().negate(),   offset:-axes[u].dot(fc)+h[u]},
+    {normal:axes[v].clone(),            offset: axes[v].dot(fc)+h[v]},
+    {normal:axes[v].clone().negate(),   offset:-axes[v].dot(fc)+h[v]},
+  ];
+  return{normal:axes[a].clone().multiplyScalar(bs),vertices:verts,sidePlanes};
+}
+
+function clipPolygonAgainstPlane(poly,n,offset){
+  const out=[]; if(!poly.length) return out;
+  let prev=poly[poly.length-1], pd=n.dot(prev)-offset;
+  for(const c of poly){
+    const cd=n.dot(c)-offset;
+    if(cd<=0){if(pd>0){const t=pd/(pd-cd);out.push(new THREE.Vector3().lerpVectors(prev,c,t));}out.push(c.clone());}
+    else if(pd<=0){const t=pd/(pd-cd);out.push(new THREE.Vector3().lerpVectors(prev,c,t));}
+    prev=c; pd=cd;
+  }
+  return out;
+}
+
+function reduceManifold(contacts,normal){
+  if(contacts.length<=4) return contacts;
+  let p0=contacts[0]; for(const c of contacts) if(c.depth>p0.depth) p0=c;
+  let p1=contacts[0],d1=-1;
+  for(const c of contacts){const d=c.position.distanceToSquared(p0.position);if(d>d1){d1=d;p1=c;}}
+  const edge=new THREE.Vector3().subVectors(p1.position,p0.position);
+  let p2=null,ba=0;
+  for(const c of contacts){if(c===p0||c===p1)continue;
+    const v=new THREE.Vector3().subVectors(c.position,p0.position);
+    const area=new THREE.Vector3().crossVectors(edge,v).dot(normal);
+    if(Math.abs(area)>Math.abs(ba)){ba=area;p2=c;}}
+  if(!p2) return[p0,p1];
+  let p3=null,bo=0;
+  for(const c of contacts){if(c===p0||c===p1||c===p2)continue;
+    const tris=[[p0,p1],[p1,p2],[p2,p0]];
+    for(const[a,bb]of tris){
+      const e=new THREE.Vector3().subVectors(bb.position,a.position);
+      const v=new THREE.Vector3().subVectors(c.position,a.position);
+      const area=new THREE.Vector3().crossVectors(e,v).dot(normal);
+      if(-Math.sign(ba)*area>bo){bo=-Math.sign(ba)*area;p3=c;}}}
+  return p3?[p0,p1,p2,p3]:[p0,p1,p2];
+}
+
+/* ── IMPULSE RESOLUTION (multi-contact) ──────────── */
 function resolve(a, b, man) {
   const n = man.normal;
-  const c = man.contact;
+  const contacts = man.contacts;          // [{position, depth}, …]
 
-  // positional correction
-  const corrMag = Math.max(man.depth - SLOP, 0) / (a.invMass + b.invMass) * BAUMGARTE;
+  // positional correction (once, using deepest contact)
+  const deepest = contacts.reduce((d,c)=>c.depth>d.depth?c:d, contacts[0]);
+  const corrMag = Math.max(deepest.depth - SLOP, 0) / (a.invMass + b.invMass) * BAUMGARTE;
   const cp = n.clone().multiplyScalar(corrMag);
   if (a.invMass) a.pos.sub(cp.clone().multiplyScalar(a.invMass));
   if (b.invMass) b.pos.add(cp.clone().multiplyScalar(b.invMass));
 
-  // contact radii
-  const rA = c.clone().sub(a.pos);
-  const rB = c.clone().sub(b.pos);
-
-  // relative velocity at contact: v + omega x r
-  const va = new THREE.Vector3(
-    a.vx + a.omega.y*rA.z - a.omega.z*rA.y,
-    a.vy + a.omega.z*rA.x - a.omega.x*rA.z,
-    a.vz + a.omega.x*rA.y - a.omega.y*rA.x
-  );
-  const vb = new THREE.Vector3(
-    b.vx + b.omega.y*rB.z - b.omega.z*rB.y,
-    b.vy + b.omega.z*rB.x - b.omega.x*rB.z,
-    b.vz + b.omega.x*rB.y - b.omega.y*rB.x
-  );
-  const relV = vb.clone().sub(va);
-  const vn = relV.dot(n);
-  if (vn > 0) return;
-
-  // normal impulse
-  const rAxN = rA.clone().cross(n);
-  const rBxN = rB.clone().cross(n);
-  function effectiveAngularMass(body, worldVec) {
-    const local = worldVec.clone().applyQuaternion(body.quat.clone().invert());
-    return local.x*local.x*body.invIX
-        + local.y*local.y*body.invIY
-        + local.z*local.z*body.invIZ;
+  function angMass(body, wv) {
+    const l = wv.clone().applyQuaternion(body.quat.clone().invert());
+    return l.x*l.x*body.invIX + l.y*l.y*body.invIY + l.z*l.z*body.invIZ;
   }
 
-// Then use it as:
-const invMA = a.invMass + effectiveAngularMass(a, rAxN);
-const invMB = b.invMass + effectiveAngularMass(b, rBxN);
-//   const invMA = a.invMass + rAxN.x*a.invIX*rAxN.x + rAxN.y*a.invIY*rAxN.y + rAxN.z*a.invIZ*rAxN.z;
-//   const invMB = b.invMass + rBxN.x*b.invIX*rBxN.x + rBxN.y*b.invIY*rBxN.y + rBxN.z*b.invIZ*rBxN.z;
-  const invME = invMA + invMB;
-  if (invME < 1e-10) return;
+  for (const ct of contacts) {
+    const c  = ct.position;
+    const rA = c.clone().sub(a.pos);
+    const rB = c.clone().sub(b.pos);
 
-  const e = Math.min(a.restitution, b.restitution);
-  const jn = -(1+e)*vn / invME;
-  if (jn <= 0) return;
+    const va = new THREE.Vector3(
+      a.vx+a.omega.y*rA.z-a.omega.z*rA.y, a.vy+a.omega.z*rA.x-a.omega.x*rA.z, a.vz+a.omega.x*rA.y-a.omega.y*rA.x);
+    const vb = new THREE.Vector3(
+      b.vx+b.omega.y*rB.z-b.omega.z*rB.y, b.vy+b.omega.z*rB.x-b.omega.x*rB.z, b.vz+b.omega.x*rB.y-b.omega.y*rB.x);
+    const relV = vb.clone().sub(va);
+    const vn = relV.dot(n);
+    if (vn > 0) continue;
 
-  const imp = n.clone().multiplyScalar(jn);
-  if (a.invMass) {
-    a.vx -= imp.x*a.invMass; a.vy -= imp.y*a.invMass; a.vz -= imp.z*a.invMass;
-    const tau = rA.clone().cross(imp);
-    a.omega.x -= tau.x*a.invIX; a.omega.y -= tau.y*a.invIY; a.omega.z -= tau.z*a.invIZ;
-  }
-  if (b.invMass) {
-    b.vx += imp.x*b.invMass; b.vy += imp.y*b.invMass; b.vz += imp.z*b.invMass;
-    const tau = rB.clone().cross(imp);
-    b.omega.x += tau.x*b.invIX; b.omega.y += tau.y*b.invIY; b.omega.z += tau.z*b.invIZ;
-  }
+    const rAxN=rA.clone().cross(n), rBxN=rB.clone().cross(n);
+    const invME = a.invMass+angMass(a,rAxN) + b.invMass+angMass(b,rBxN);
+    if (invME<1e-10) continue;
 
-  // friction
-  const va2 = new THREE.Vector3(
-    a.vx+a.omega.y*rA.z-a.omega.z*rA.y,
-    a.vy+a.omega.z*rA.x-a.omega.x*rA.z,
-    a.vz+a.omega.x*rA.y-a.omega.y*rA.x
-  );
-  const vb2 = new THREE.Vector3(
-    b.vx+b.omega.y*rB.z-b.omega.z*rB.y,
-    b.vy+b.omega.z*rB.x-b.omega.x*rB.z,
-    b.vz+b.omega.x*rB.y-b.omega.y*rB.x
-  );
-  const relV2 = vb2.clone().sub(va2);
-  let tan = relV2.clone().sub(n.clone().multiplyScalar(relV2.dot(n)));
-  const tl = tan.length();
-  if (tl < 1e-6) return;
-  tan.normalize();
+    const e = Math.min(a.restitution,b.restitution);
+    const jn = -(1+e)*vn/invME;
+    if (jn<=0) continue;
 
-  const rAxT = rA.clone().cross(tan);
-  const rBxT = rB.clone().cross(tan);
- 
-// Then use it as:
-const invMA2 = a.invMass + effectiveAngularMass(a, rAxT);
-const invMB2 = b.invMass + effectiveAngularMass(b, rBxT);
-//   const invMA2 = a.invMass+rAxT.x*a.invIX*rAxT.x+rAxT.y*a.invIY*rAxT.y+rAxT.z*a.invIZ*rAxT.z;
-//   const invMB2 = b.invMass+rBxT.x*b.invIX*rBxT.x+rBxT.y*b.invIY*rBxT.y+rBxT.z*b.invIZ*rBxT.z;
-  const invME2 = invMA2+invMB2;
-  if (invME2 < 1e-10) return;
-
-  let jt = -relV2.dot(tan)/invME2;
-  const mu = (a.friction+b.friction)/2;
-  if (jt > jn*mu) jt = jn*mu; else if (jt < -jn*mu) jt = -jn*mu;
-
-  const fi = tan.clone().multiplyScalar(jt);
-  if (a.invMass) {
-    a.vx -= fi.x*a.invMass; a.vy -= fi.y*a.invMass; a.vz -= fi.z*a.invMass;
-    const tau = rA.clone().cross(fi);
-    function applyAngularImpulse(body, worldTorque) {
-        const localTau = worldTorque.clone().applyQuaternion(body.quat.clone().invert());
-        localTau.x *= body.invIX;
-        localTau.y *= body.invIY;
-        localTau.z *= body.invIZ;
-        const worldDelta = localTau.applyQuaternion(body.quat);
-        body.omega.sub(worldDelta);  // or add, depending on sign convention
+    const imp = n.clone().multiplyScalar(jn);
+    if (a.invMass) {
+      a.vx-=imp.x*a.invMass; a.vy-=imp.y*a.invMass; a.vz-=imp.z*a.invMass;
+      const tau=rA.clone().cross(imp);
+      a.omega.x-=tau.x*a.invIX; a.omega.y-=tau.y*a.invIY; a.omega.z-=tau.z*a.invIZ;
     }
-    applyAngularImpulse(a, tau);
-    // a.omega.x -= tau.x*a.invIX; a.omega.y -= tau.y*a.invIY; a.omega.z -= tau.z*a.invIZ;
-  }
-  if (b.invMass) {
-    b.vx += fi.x*b.invMass; b.vy += fi.y*b.invMass; b.vz += fi.z*b.invMass;
-    const tau = rB.clone().cross(fi);
-    b.omega.x += tau.x*b.invIX; b.omega.y += tau.y*b.invIY; b.omega.z += tau.z*b.invIZ;
+    if (b.invMass) {
+      b.vx+=imp.x*b.invMass; b.vy+=imp.y*b.invMass; b.vz+=imp.z*b.invMass;
+      const tau=rB.clone().cross(imp);
+      b.omega.x+=tau.x*b.invIX; b.omega.y+=tau.y*b.invIY; b.omega.z+=tau.z*b.invIZ;
+    }
+
+    // friction at this contact
+    const va2=new THREE.Vector3(a.vx+a.omega.y*rA.z-a.omega.z*rA.y,a.vy+a.omega.z*rA.x-a.omega.x*rA.z,a.vz+a.omega.x*rA.y-a.omega.y*rA.x);
+    const vb2=new THREE.Vector3(b.vx+b.omega.y*rB.z-b.omega.z*rB.y,b.vy+b.omega.z*rB.x-b.omega.x*rB.z,b.vz+b.omega.x*rB.y-b.omega.y*rB.x);
+    let tan=vb2.clone().sub(va2).sub(n.clone().multiplyScalar(vb2.clone().sub(va2).dot(n)));
+    const tl=tan.length(); if(tl<1e-6) continue;
+    tan.normalize();
+    const rAxT=rA.clone().cross(tan), rBxT=rB.clone().cross(tan);
+    const invME2=a.invMass+angMass(a,rAxT)+b.invMass+angMass(b,rBxT);
+    if(invME2<1e-10) continue;
+    let jt=-vb2.clone().sub(va2).dot(tan)/invME2;
+    const mu=(a.friction+b.friction)/2;
+    if(jt>jn*mu) jt=jn*mu; else if(jt<-jn*mu) jt=-jn*mu;
+    const fi=tan.clone().multiplyScalar(jt);
+    if (a.invMass) {
+      a.vx-=fi.x*a.invMass; a.vy-=fi.y*a.invMass; a.vz-=fi.z*a.invMass;
+      const tau=rA.clone().cross(fi);
+      a.omega.x-=tau.x*a.invIX; a.omega.y-=tau.y*a.invIY; a.omega.z-=tau.z*a.invIZ;
+    }
+    if (b.invMass) {
+      b.vx+=fi.x*b.invMass; b.vy+=fi.y*b.invMass; b.vz+=fi.z*b.invMass;
+      const tau=rB.clone().cross(fi);
+      b.omega.x+=tau.x*b.invIX; b.omega.y+=tau.y*b.invIY; b.omega.z+=tau.z*b.invIZ;
+    }
   }
 }
 

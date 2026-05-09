@@ -99,7 +99,7 @@ function boxBoxManifold(A, B) {
     // (this avoids jittery edge-edge contacts when they are nearly coplanar with a face).
     function test(L, pen, caseId, i, j, biasFace) {
         // bias: for edge-edge axes, add small epsilon so faces win ties
-        const biased = biasFace ? pen : pen - 1e-4;
+        const biased = biasFace ? pen : pen + 1e-4;
         // if (biased > bestPen) {
         if (biased < bestPen) {
             bestPen = biased;
