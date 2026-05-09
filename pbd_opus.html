@@ -209,7 +209,7 @@ function satOBB(a, b) {
 
   const t = new THREE.Vector3().subVectors(b.pos, a.pos);
   const tA = new THREE.Vector3(t.dot(axesA[0]),t.dot(axesA[1]),t.dot(axesA[2]));
-  const tB = new THREE.Vector3(t.dot(axesB[0]),t.dot(axesB[1]),t.dot(axesB[2]));
+  // const tB = new THREE.Vector3(t.dot(axesB[0]),t.dot(axesB[1]),t.dot(axesB[2]));
 
   let bestPen=Infinity, bestAxis=new THREE.Vector3(), bestCase=-1, bestI=0, bestJ=0;
 
@@ -232,7 +232,8 @@ function satOBB(a, b) {
   // Face axes of B
   for(let j=0;j<3;j++){
     const rA=hA[0]*AbsR[0][j]+hA[1]*AbsR[1][j]+hA[2]*AbsR[2][j], rB=hB[j];
-    const pen=rA+rB-Math.abs(tB.getComponent(j));
+    // const pen=rA+rB-Math.abs(tB.getComponent(j));
+    const pen = rA+rB-Math.abs(tA[0]*R[0][j] + tA[1]*R[1][j] + tA[2]*R[2][j]);
     if(pen<0) return null;
     test(axesB[j],pen,3+j,0,j,true);
   }
@@ -241,10 +242,19 @@ function satOBB(a, b) {
     const L=new THREE.Vector3().crossVectors(axesA[i],axesB[j]);
     const len2=L.lengthSq(); if(len2<1e-8) continue;
     L.multiplyScalar(1/Math.sqrt(len2));
-    const i1=(i+1)%3,i2=(i+2)%3,j1=(j+1)%3,j2=(j+2)%3;
+    let i1=(i+1)%3,i2=(i+2)%3,j1=(j+1)%3,j2=(j+2)%3;
+    const ii1=(i+2)%3, ii2=(i+1)%3;
+    const jj1=i1, jj2=i2;
+    if (j == 1) {
+        const tmp = j1;    j1 = j2;     j2 = tmp;
+    }
+    if (i == 1) {
+        const tmp = i1;    i1 = i2;     i2 = tmp;
+    }
     const rA=hA[i1]*AbsR[i2][j]+hA[i2]*AbsR[i1][j];
     const rB=hB[j1]*AbsR[i][j2]+hB[j2]*AbsR[i][j1];
-    const dist=Math.abs(tA.getComponent(i2)*R[i1][j]-tA.getComponent(i1)*R[i2][j]);
+    // const dist=Math.abs(tA.getComponent(i2)*R[i1][j]-tA.getComponent(i1)*R[i2][j]);
+    const dist = Math.abs(tA.getComponent(ii1)*R[jj1][j] - tA.getComponent(ii2)*R[jj2][j]);
     const pen=rA+rB-dist;
     if(pen<0) return null;
     test(L,pen,6+i*3+j,i,j,false);

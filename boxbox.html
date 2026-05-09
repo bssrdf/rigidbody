@@ -92,6 +92,11 @@ function boxBoxManifold(A, B) {
     let bestCase = -1; // 0-2 face A, 3-5 face B, 6-14 edge-edge
     let bestI = 0, bestJ = 0;
 
+    // let bestPenE = -Infinity;
+    // let bestAxisE = new THREE.Vector3();
+    // let bestCaseE = -1; // 0-2 face A, 3-5 face B, 6-14 edge-edge
+    // let bestI_E = 0, bestJ_E = 0;
+
     // Helper: test axis 'L' with projection radii rA, rB and center distance 'dist'.
     // Penetration = rA + rB - |dist|. If <0 -> separated.
     // We keep the axis with the *largest* penetration (i.e. least negative / smallest positive).
@@ -109,7 +114,7 @@ function boxBoxManifold(A, B) {
             bestCase = caseId;
             bestI = i; bestJ = j;
         }
-        // console.log("test", caseId, pen, i, j, bestPen);
+        // console.log("test", caseId, pen, i, j, bestI, bestJ, bestPen, bestAxis, L);
     }
 
     // Face axes of A
@@ -129,7 +134,8 @@ function boxBoxManifold(A, B) {
     for (let j=0;j<3;j++) {
         const rA = ah[0]*AbsR[0][j] + ah[1]*AbsR[1][j] + ah[2]*AbsR[2][j];
         const rB = bh[j];
-        const dist = Math.abs(tB.getComponent(j));
+        // const dist = Math.abs(tB.getComponent(j));
+        const dist = Math.abs(tA[0]*R[0][j] + tA[1]*R[1][j] + tA[2]*R[2][j]);
         const pen = rA + rB - dist;
         if (pen < 0) {
             // console.log("case B", j);
@@ -141,17 +147,42 @@ function boxBoxManifold(A, B) {
     for (let i=0;i<3;i++) {
         for (let j=0;j<3;j++) {
             const L = new THREE.Vector3().crossVectors(A.axes[i], B.axes[j]);
+            // console.log("L", i, j, A.axes[i], B.axes[j], L);
             const len2 = L.lengthSq();
-            if (len2 < 1e-8) continue; // parallel edges, skip
+            if (len2 < 1e-8) {
+                // console.log("skipping parallel edges", len2, i, j);
+                // console.log("skipping parallel edges", A.axes[i], B.axes[j]);
+                continue; // parallel edges, skip
+            }
             L.multiplyScalar(1/Math.sqrt(len2));
 
             // projection radii using Gottschalk formulation
-            const i1=(i+1)%3, i2=(i+2)%3, j1=(j+1)%3, j2=(j+2)%3;
+            let i1=(i+1)%3, i2=(i+2)%3, j1=(j+1)%3, j2=(j+2)%3;
+            let ii1=(i+2)%3, ii2=(i+1)%3;
+            const jj1=i1, jj2=i2;
+            if (j == 1) {
+                const tmp = j1;
+                j1 = j2;
+                j2 = tmp;
+            }
+            if (i == 1) {
+                const tmp = i1;
+                i1 = i2;
+                i2 = tmp;
+            }
             const rA = ah[i1]*AbsR[i2][j] + ah[i2]*AbsR[i1][j];
             const rB = bh[j1]*AbsR[i][j2] + bh[j2]*AbsR[i][j1];
-            // const dist = Math.abs(t.dot(L));
-            const dist = Math.abs(tA.getComponent(i2)*R[i1][j] - tA.getComponent(i1)*R[i2][j]);
+            // const rA = ah[i1]*AbsR[i1][j] + ah[i2]*AbsR[i2][j];
+            // const rB = bh[j1]*AbsR[i][j2] + bh[j2]*AbsR[i][j1];
+            const dist1 = Math.abs(t.dot(L));
+            const dist = Math.abs(tA.getComponent(ii1)*R[jj1][j] - tA.getComponent(ii2)*R[jj2][j]);
             const pen = rA + rB - dist;
+            // console.log("edge-edge",  6 + i*3 + j, i, j, pen, rA, rB, dist, dist1);
+            // console.log("edge-edge",  6 + i*3 + j, i, j, i1, i2, j1, j2);
+            // console.log("edge-edge A",  6 + i*3 + j, i, j, ah[i1], AbsR[i2][j], ah[i2], AbsR[i1][j]);
+            // console.log("edge-edge B",  6 + i*3 + j, i, j, bh[j1], AbsR[i][j2], bh[j2], AbsR[i][j1]);
+            // console.log("edge-edge",  6 + i*3 + j, i, j, ii1, jj1, j, ii2, jj2, j,
+            //        i1,i2,j,i2,i1,j, j1,i,j2,j2,i,j1);
             if (pen < 0) {
                 // console.log("case C", i, j, pen);
                 // console.log("case C", i, j, rA, rB, dist);
@@ -171,6 +202,7 @@ function boxBoxManifold(A, B) {
     if (bestCase >= 6) {
         // Edge–edge contact: single point = closest points between the two edges
         return edgeEdgeContact(A, B, bestI, bestJ, bestAxis, bestPen);
+        // return edgeEdgeContact(A, B, bestI_E, bestJ_E, bestAxisE, bestPenE);
     } else {
         // Face contact: clip the incident face against the reference face's side planes
         const refIsA = bestCase < 3;
@@ -184,8 +216,8 @@ function boxBoxManifold(A, B) {
 function edgeEdgeContact(A, B, iA, iB, normal, depth) {
     // Find the edge of A that is "most in the direction of +normal"
     // (i.e. the edge whose midpoint is furthest along +normal from A's center)
-    const edgeA = supportEdge(A, iA, normal);
-    const edgeB = supportEdge(B, iB, normal.clone().negate());
+    const edgeA = supportEdge(A, iA, normal, "A");
+    const edgeB = supportEdge(B, iB, normal.clone().negate(), "B");
 
     const p = closestPointsOnSegments(edgeA[0], edgeA[1], edgeB[0], edgeB[1]);
     // console.log("edge-edge N", normal, iA, iB);
@@ -208,10 +240,11 @@ function edgeEdgeContact(A, B, iA, iB, normal, depth) {
 
 // Return the edge (two endpoints) parallel to box.axes[axisIdx] that is
 // furthest along direction 'dir'.
-function supportEdge(box, axisIdx, dir) {
+function supportEdge(box, axisIdx, dir, mark) {
     const i1 = (axisIdx+1)%3, i2 = (axisIdx+2)%3;
     const s1 = Math.sign(box.axes[i1].dot(dir)) || 1;
     const s2 = Math.sign(box.axes[i2].dot(dir)) || 1;
+    // console.log("supportEdge", mark, axisIdx, dir, i1, i2, s1, s2);
     const h = [box.h.x, box.h.y, box.h.z];
     const base = new THREE.Vector3().copy(box.c)
         .addScaledVector(box.axes[i1], s1 * h[i1])
@@ -445,10 +478,11 @@ function makeBoxMesh(sx, sy, sz, color) {
     mesh.userData.halfExtents = new THREE.Vector3(sx/2, sy/2, sz/2);
     return mesh;
 }
-const meshA = makeBoxMesh(50, 2, 50, 0x4488ff);
+// const meshA = makeBoxMesh(50, 2, 50, 0x4488ff);
+const meshA = makeBoxMesh(2, 2, 2, 0x4488ff);
 const meshB = makeBoxMesh(1.6, 2.4, 1.2, 0xff8844);
 meshA.position.set(0,0,0);
-meshB.position.set(1.4, 4, 0.5);
+meshB.position.set(1.4, 3, 0.5);
 // meshB.rotation.set(0.4, 0.7, 0.3);
 
 // --- Debug visuals ---------------------------------------------------------
