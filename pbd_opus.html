@@ -82,9 +82,9 @@ const contactGroup = new THREE.Group();
 scene.add(contactGroup);
 
 /* ── CONSTANTS ─────────────────────────────────────── */
-const GRAVITY = -20;
+const GRAVITY = -9.81;
 const SUBSTEPS = 20;
-const BAUMGARTE = 0.6;
+const BAUMGARTE = 0.2;
 const SLOP = 0.02;
 
 /* ── BODY ──────────────────────────────────────────── */
@@ -434,6 +434,8 @@ function reduceManifold(contacts,normal){
   return p3?[p0,p1,p2,p3]:[p0,p1,p2];
 }
 
+
+
 /* ── IMPULSE RESOLUTION (multi-contact) ──────────── */
 function resolve(a, b, man) {
   const n = man.normal;
@@ -450,6 +452,24 @@ function resolve(a, b, man) {
     const l = wv.clone().applyQuaternion(body.quat.clone().invert());
     return l.x*l.x*body.invIX + l.y*l.y*body.invIY + l.z*l.z*body.invIZ;
   }
+  /** Angular impulse: tau (world) → local frame → scale by invInertia diagonal → back to world */
+  function applyAngularImpulse(body, tau, sign) {
+    // const local = tau.clone().applyQuaternion(body.quat.conjugate());
+    const local = tau.clone().applyQuaternion(body.quat.clone().invert());
+    local.x *= body.invIX; local.y *= body.invIY; local.z *= body.invIZ;
+    const worldDelta = local.applyQuaternion(body.quat);
+    if (sign < 0) body.omega.sub(worldDelta); else body.omega.add(worldDelta);
+  }
+
+   /** Effective inverse mass + rotational inertia contribution along axis */
+    function invEffectiveMass(body, rxAxis) {
+      // const rxAxis = r.clone().cross(axis);
+      // const local = rxAxis.clone().applyQuaternion(body.quat.conjugate());
+      const local = rxAxis.clone().applyQuaternion(body.quat.clone().invert());
+      return body.invMass + local.x * local.x * body.invIX
+                                + local.y * local.y * body.invIY
+                                + local.z * local.z * body.invIZ;
+    }
 
   for (const ct of contacts) {
     const c  = ct.position;
@@ -465,7 +485,8 @@ function resolve(a, b, man) {
     if (vn > 0) continue;
 
     const rAxN=rA.clone().cross(n), rBxN=rB.clone().cross(n);
-    const invME = a.invMass+angMass(a,rAxN) + b.invMass+angMass(b,rBxN);
+      const invME = invEffectiveMass(a, rAxN) + invEffectiveMass(b, rBxN);
+    // const invME = a.invMass+angMass(a,rAxN) + b.invMass+angMass(b,rBxN);
     if (invME<1e-10) continue;
 
     const e = Math.min(a.restitution,b.restitution);
@@ -476,12 +497,14 @@ function resolve(a, b, man) {
     if (a.invMass) {
       a.vx-=imp.x*a.invMass; a.vy-=imp.y*a.invMass; a.vz-=imp.z*a.invMass;
       const tau=rA.clone().cross(imp);
-      a.omega.x-=tau.x*a.invIX; a.omega.y-=tau.y*a.invIY; a.omega.z-=tau.z*a.invIZ;
+      // a.omega.x-=tau.x*a.invIX; a.omega.y-=tau.y*a.invIY; a.omega.z-=tau.z*a.invIZ;
+      applyAngularImpulse(a, tau, -1);
     }
     if (b.invMass) {
       b.vx+=imp.x*b.invMass; b.vy+=imp.y*b.invMass; b.vz+=imp.z*b.invMass;
       const tau=rB.clone().cross(imp);
-      b.omega.x+=tau.x*b.invIX; b.omega.y+=tau.y*b.invIY; b.omega.z+=tau.z*b.invIZ;
+      // b.omega.x+=tau.x*b.invIX; b.omega.y+=tau.y*b.invIY; b.omega.z+=tau.z*b.invIZ;
+      applyAngularImpulse(b, tau, 1);
     }
 
     // friction at this contact
@@ -491,7 +514,8 @@ function resolve(a, b, man) {
     const tl=tan.length(); if(tl<1e-6) continue;
     tan.normalize();
     const rAxT=rA.clone().cross(tan), rBxT=rB.clone().cross(tan);
-    const invME2=a.invMass+angMass(a,rAxT)+b.invMass+angMass(b,rBxT);
+    // const invME2=a.invMass+angMass(a,rAxT)+b.invMass+angMass(b,rBxT);
+    const invME2 = invEffectiveMass(a, rAxT) + invEffectiveMass(b, rBxT);
     if(invME2<1e-10) continue;
     let jt=-vb2.clone().sub(va2).dot(tan)/invME2;
     const mu=(a.friction+b.friction)/2;
@@ -500,12 +524,14 @@ function resolve(a, b, man) {
     if (a.invMass) {
       a.vx-=fi.x*a.invMass; a.vy-=fi.y*a.invMass; a.vz-=fi.z*a.invMass;
       const tau=rA.clone().cross(fi);
-      a.omega.x-=tau.x*a.invIX; a.omega.y-=tau.y*a.invIY; a.omega.z-=tau.z*a.invIZ;
+      // a.omega.x-=tau.x*a.invIX; a.omega.y-=tau.y*a.invIY; a.omega.z-=tau.z*a.invIZ;
+      applyAngularImpulse(a, tau, -1);
     }
     if (b.invMass) {
       b.vx+=fi.x*b.invMass; b.vy+=fi.y*b.invMass; b.vz+=fi.z*b.invMass;
       const tau=rB.clone().cross(fi);
-      b.omega.x+=tau.x*b.invIX; b.omega.y+=tau.y*b.invIY; b.omega.z+=tau.z*b.invIZ;
+      // b.omega.x+=tau.x*b.invIX; b.omega.y+=tau.y*b.invIY; b.omega.z+=tau.z*b.invIZ;
+      applyAngularImpulse(b, tau, 1);
     }
   }
 }
