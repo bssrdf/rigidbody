@@ -65,9 +65,11 @@ function boxBoxManifold(A, B) {
     // 15 candidate axes: 3 face normals of A, 3 of B, 9 cross products
     const R   = [[0,0,0],[0,0,0],[0,0,0]]; // R[i][j] = A.axes[i] . B.axes[j]
     const AbsR= [[0,0,0],[0,0,0],[0,0,0]];
-    for (let i=0;i<3;i++) for (let j=0;j<3;j++) {
+    for (let i=0;i<3;i++) {
+      for (let j=0;j<3;j++) {
         R[i][j]    = A.axes[i].dot(B.axes[j]);
         AbsR[i][j] = Math.abs(R[i][j]) + EPS;
+      }
     }
 
     const t = new THREE.Vector3().subVectors(B.c, A.c);
@@ -75,6 +77,13 @@ function boxBoxManifold(A, B) {
 
     const ah = [A.h.x, A.h.y, A.h.z];
     const bh = [B.h.x, B.h.y, B.h.z];
+    console.log("t, tA", t, tA);
+    for (let i=0;i<3;i++) {
+        console.log("R", i, R[i], A.axes[i], B.axes[0], B.axes[1], B.axes[2]);
+    }
+    for (let i=0;i<3;i++) {
+        console.log("AbsR", i, AbsR[i]);
+    }
 
 
     // const vertsA = A.vertices();
@@ -114,7 +123,7 @@ function boxBoxManifold(A, B) {
             bestCase = caseId;
             bestI = i; bestJ = j;
         }
-        // console.log("test", caseId, pen, i, j, bestI, bestJ, bestPen, bestAxis, L);
+        console.log("test", caseId, pen, i, j, bestI, bestJ, bestPen, bestAxis, L);
     }
 
     // Face axes of A
@@ -135,8 +144,10 @@ function boxBoxManifold(A, B) {
         const rA = ah[0]*AbsR[0][j] + ah[1]*AbsR[1][j] + ah[2]*AbsR[2][j];
         const rB = bh[j];
         // const dist = Math.abs(tB.getComponent(j));
-        const dist = Math.abs(tA[0]*R[0][j] + tA[1]*R[1][j] + tA[2]*R[2][j]);
+        // const dist = Math.abs(tA[0]*R[0][j] + tA[1]*R[1][j] + tA[2]*R[2][j]);
+        const dist = Math.abs(tA.x*R[0][j] + tA.y*R[1][j] + tA.z*R[2][j]);
         const pen = rA + rB - dist;
+        // console.log("face B", j, pen, rA, rB, dist, tA[0], R[0][j], tA[1], R[1][j], tA[2], R[2][j]);
         if (pen < 0) {
             // console.log("case B", j);
             return null;
@@ -177,10 +188,10 @@ function boxBoxManifold(A, B) {
             const dist1 = Math.abs(t.dot(L));
             const dist = Math.abs(tA.getComponent(ii1)*R[jj1][j] - tA.getComponent(ii2)*R[jj2][j]);
             const pen = rA + rB - dist;
-            // console.log("edge-edge",  6 + i*3 + j, i, j, pen, rA, rB, dist, dist1);
-            // console.log("edge-edge",  6 + i*3 + j, i, j, i1, i2, j1, j2);
-            // console.log("edge-edge A",  6 + i*3 + j, i, j, ah[i1], AbsR[i2][j], ah[i2], AbsR[i1][j]);
-            // console.log("edge-edge B",  6 + i*3 + j, i, j, bh[j1], AbsR[i][j2], bh[j2], AbsR[i][j1]);
+            console.log("edge-edge",  6 + i*3 + j, i, j, pen, rA, rB, dist, dist1);
+            console.log("edge-edge",  6 + i*3 + j, i, j, i1, i2, j1, j2);
+            console.log("edge-edge A",  6 + i*3 + j, i, j, ah[i1], AbsR[i2][j], ah[i2], AbsR[i1][j]);
+            console.log("edge-edge B",  6 + i*3 + j, i, j, bh[j1], AbsR[i][j2], bh[j2], AbsR[i][j1]);
             // console.log("edge-edge",  6 + i*3 + j, i, j, ii1, jj1, j, ii2, jj2, j,
             //        i1,i2,j,i2,i1,j, j1,i,j2,j2,i,j1);
             if (pen < 0) {

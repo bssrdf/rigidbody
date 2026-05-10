@@ -233,7 +233,7 @@ function satOBB(a, b) {
   for(let j=0;j<3;j++){
     const rA=hA[0]*AbsR[0][j]+hA[1]*AbsR[1][j]+hA[2]*AbsR[2][j], rB=hB[j];
     // const pen=rA+rB-Math.abs(tB.getComponent(j));
-    const pen = rA+rB-Math.abs(tA[0]*R[0][j] + tA[1]*R[1][j] + tA[2]*R[2][j]);
+    const pen = rA+rB-Math.abs(tA.x*R[0][j] + tA.y*R[1][j] + tA.z*R[2][j]);
     if(pen<0) return null;
     test(axesB[j],pen,3+j,0,j,true);
   }
@@ -269,7 +269,7 @@ function satOBB(a, b) {
 /* ── edge-edge: closest pts on two segments ─────── */
 function supportEdge(pos,axes,h,axisIdx,dir){
   const i1=(axisIdx+1)%3, i2=(axisIdx+2)%3;
-  const s1=Math.sign(axes[i1].dot(dir))||1, s2=Math.sign(axes[i2].dot(dir))||1;
+  const s1=Math.sign(axes[i1].dot(dir))||1, s2=Math.sign(axes[i2].dot(dir))||-1;
   const base=new THREE.Vector3().copy(pos)
     .addScaledVector(axes[i1],s1*h[i1]).addScaledVector(axes[i2],s2*h[i2]);
   return [base.clone().addScaledVector(axes[axisIdx],-h[axisIdx]),
