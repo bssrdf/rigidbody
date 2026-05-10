@@ -59,6 +59,28 @@ class OBB {
 // ======================================================================
 
 const EPS = 1e-6;
+const JL_TINY = 1e-7;
+const JL_TOLERANCE = 1e-4;
+
+/** Check if any corner of `inner` lies inside `outer` AABB in outer-local space */
+function _cornerInside(outer, verts) {
+    for (const v in verts) {
+        const d = new THREE.Vector3().subVectors(verts[v], outer.c);
+        const local = new THREE.Vector3(
+            d.dot(outer.axes[0]),
+            d.dot(outer.axes[1]),
+            d.dot(outer.axes[2])
+        );
+        // console.log("corner", verts[v], local, outer.c, outer.h);
+        if (Math.abs(local.x) <= outer.h.x + JL_TOLERANCE &&
+            Math.abs(local.y) <= outer.h.y + JL_TOLERANCE &&
+            Math.abs(local.z) <= outer.h.z + JL_TOLERANCE) {
+                // console.log("corner" , verts[v], "inside", outer.c, outer.h);
+                return true;
+            }
+    }
+    return false;
+}
 
 function boxBoxManifold(A, B) {
     // -------- 1. SAT: find axis of minimum penetration --------
@@ -77,13 +99,13 @@ function boxBoxManifold(A, B) {
 
     const ah = [A.h.x, A.h.y, A.h.z];
     const bh = [B.h.x, B.h.y, B.h.z];
-    console.log("t, tA", t, tA);
-    for (let i=0;i<3;i++) {
-        console.log("R", i, R[i], A.axes[i], B.axes[0], B.axes[1], B.axes[2]);
-    }
-    for (let i=0;i<3;i++) {
-        console.log("AbsR", i, AbsR[i]);
-    }
+    // console.log("t, tA", t, tA);
+    // for (let i=0;i<3;i++) {
+    //     console.log("R", i, R[i], A.axes[i], B.axes[0], B.axes[1], B.axes[2]);
+    // }
+    // for (let i=0;i<3;i++) {
+    //     console.log("AbsR", i, AbsR[i]);
+    // }
 
 
     // const vertsA = A.vertices();
@@ -101,10 +123,9 @@ function boxBoxManifold(A, B) {
     let bestCase = -1; // 0-2 face A, 3-5 face B, 6-14 edge-edge
     let bestI = 0, bestJ = 0;
 
-    // let bestPenE = -Infinity;
-    // let bestAxisE = new THREE.Vector3();
-    // let bestCaseE = -1; // 0-2 face A, 3-5 face B, 6-14 edge-edge
-    // let bestI_E = 0, bestJ_E = 0;
+    let bestPenF = Infinity;
+    let bestAxisF = new THREE.Vector3();
+    let bestCaseF = -1; // 0-2 face A, 3-5 face B, 6-14 edge-edge
 
     // Helper: test axis 'L' with projection radii rA, rB and center distance 'dist'.
     // Penetration = rA + rB - |dist|. If <0 -> separated.
@@ -123,7 +144,13 @@ function boxBoxManifold(A, B) {
             bestCase = caseId;
             bestI = i; bestJ = j;
         }
-        console.log("test", caseId, pen, i, j, bestI, bestJ, bestPen, bestAxis, L);
+        if (caseId < 6 && pen < bestPenF) {
+            bestPenF = pen;
+            bestAxisF.copy(L);
+            if (L.dot(t) < 0) bestAxisF.negate();
+            bestCaseF = caseId;
+        }
+        // console.log("test", caseId, pen, i, j, bestI, bestJ, bestPen, bestAxis, L);
     }
 
     // Face axes of A
@@ -188,10 +215,10 @@ function boxBoxManifold(A, B) {
             const dist1 = Math.abs(t.dot(L));
             const dist = Math.abs(tA.getComponent(ii1)*R[jj1][j] - tA.getComponent(ii2)*R[jj2][j]);
             const pen = rA + rB - dist;
-            console.log("edge-edge",  6 + i*3 + j, i, j, pen, rA, rB, dist, dist1);
-            console.log("edge-edge",  6 + i*3 + j, i, j, i1, i2, j1, j2);
-            console.log("edge-edge A",  6 + i*3 + j, i, j, ah[i1], AbsR[i2][j], ah[i2], AbsR[i1][j]);
-            console.log("edge-edge B",  6 + i*3 + j, i, j, bh[j1], AbsR[i][j2], bh[j2], AbsR[i][j1]);
+            // console.log("edge-edge",  6 + i*3 + j, i, j, pen, rA, rB, dist, dist1);
+            // console.log("edge-edge",  6 + i*3 + j, i, j, i1, i2, j1, j2);
+            // console.log("edge-edge A",  6 + i*3 + j, i, j, ah[i1], AbsR[i2][j], ah[i2], AbsR[i1][j]);
+            // console.log("edge-edge B",  6 + i*3 + j, i, j, bh[j1], AbsR[i][j2], bh[j2], AbsR[i][j1]);
             // console.log("edge-edge",  6 + i*3 + j, i, j, ii1, jj1, j, ii2, jj2, j,
             //        i1,i2,j,i2,i1,j, j1,i,j2,j2,i,j1);
             if (pen < 0) {
@@ -208,12 +235,20 @@ function boxBoxManifold(A, B) {
         // console.log("case D");
         return null;
     }
+    // console.log("best case", bestCase, bestAxis, bestPen);
 
     // -------- 2. Generate contact points from the chosen axis --------
     if (bestCase >= 6) {
         // Edge–edge contact: single point = closest points between the two edges
-        return edgeEdgeContact(A, B, bestI, bestJ, bestAxis, bestPen);
-        // return edgeEdgeContact(A, B, bestI_E, bestJ_E, bestAxisE, bestPenE);
+        const vertsA = A.vertices();
+        const vertsB = B.vertices();
+        if (_cornerInside(B, vertsA) || _cornerInside(A, vertsB)) {
+            // console.log("corner inside", bestAxisF, bestPenF, bestCaseF);
+            const refIsA = bestCaseF < 3;
+            return faceContact(A, B, bestAxisF, bestPenF, refIsA);
+        } else {
+           return edgeEdgeContact(A, B, bestI, bestJ, bestAxis, bestPen);
+        }
     } else {
         // Face contact: clip the incident face against the reference face's side planes
         const refIsA = bestCase < 3;
