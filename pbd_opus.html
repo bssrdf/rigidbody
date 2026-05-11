@@ -201,8 +201,8 @@ function spawnBlock(x, y, z, size) {
 }
 
 let idx=0;
-for (const n of [6,5,5,4,4,3,2,2,1,1])
-  for (let i=0;i<n&&idx<30;i++,idx++)
+for (const n of [100,6,5,5,4,4,3,2,2,1,1])
+  for (let i=0;i<n&&idx<100;i++,idx++)
     spawnBlock((Math.random()-.5)*6, 4+idx*1.4, (Math.random()-.5)*3, 0.5+Math.random()*0.6);
 
 /* ── SAT OBB vs OBB (Gottschalk — up to 4 contacts) ── */
