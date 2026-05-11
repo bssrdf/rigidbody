@@ -2,23 +2,23 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Box2D-Style Rigid Body Dynamics</title>
+<title>Doomsday City — PBD Rigid Bodies</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { overflow: hidden; background: #111; font-family: sans-serif; }
+  body { overflow: hidden; background: #000; font-family: 'Courier New', monospace; }
   canvas { display: block; }
   #hud {
-    position: absolute; top: 12px; left: 12px; color: #ccc;
-    background: rgba(0,0,0,0.6); padding: 10px 14px; border-radius: 8px;
-    font-size: 13px; pointer-events: none; line-height: 1.6;
+    position: fixed; top:20px; left:20px; color:#ff6633; font-size:0.8em;
+    letter-spacing:0.1em; z-index:10; text-shadow:0 0 10px #ff4400;
   }
-  #hud span { color: #7cf; }
+  #hud div { margin-bottom:5px; }
 </style>
 </head>
 <body>
 <div id="hud">
-  <span>Box2D-Style Rigid Body Solver</span><br>
-  <span id="count">0</span> bodies · <span id="fps">0</span> FPS · Click to spawn
+  <div>DOOMSDAY CITY — PBD Solver</div>
+  <div>BODIES: <span id="count">0</span></div>
+  <div>FPS: <span id="fps">0</span></div>
 </div>
 
 <script type="importmap">
@@ -34,13 +34,13 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-/* ── SCENE ─────────────────────────────────────────── */
+/* ── SCENE (Doomsday-style) ─────────────────────────────── */
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x181825);
-scene.fog = new THREE.FogExp2(0x181825, 0.018);
+scene.background = new THREE.Color(0x0a0505);
+scene.fog = new THREE.FogExp2(0x0a0505, 0.002);
 
-const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
-camera.position.set(16, 12, 18);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 2000);
+camera.position.set(100, 80, 150);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(innerWidth, innerHeight);
@@ -48,59 +48,59 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
 document.body.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
-controls.target.set(0, 3, 0);
-controls.maxPolarAngle = Math.PI * 0.48;
+controls.dampingFactor = 0.05;
+controls.maxPolarAngle = Math.PI / 2.05;
+controls.minDistance = 20;
+controls.maxDistance = 400;
+controls.target.set(0, 15, 0);
 
-scene.add(new THREE.AmbientLight(0x404060, 0.6));
-const dl = new THREE.DirectionalLight(0xffeedd, 2);
-dl.position.set(12, 25, 18);
-dl.castShadow = true;
-dl.shadow.mapSize.set(2048, 2048);
-Object.assign(dl.shadow.camera, { left:-25, right:25, top:25, bottom:-25, near:1, far:80 });
-dl.shadow.bias = -0.0005;
-scene.add(dl);
-scene.add(new THREE.HemisphereLight(0x8888ff, 0x444422, 0.4));
+/* ── LIGHTING ──────────────────────────────────────────── */
+scene.add(new THREE.AmbientLight(0x332211, 0.8));
+scene.add(new THREE.HemisphereLight(0x665544, 0x221100, 0.6));
 
-const FLOOR_Y = 0;
-const flMesh = new THREE.Mesh(
-  new THREE.PlaneGeometry(60, 60),
-  new THREE.MeshStandardMaterial({ color: 0x222238, roughness: 0.85, metalness: 0.1 })
-);
-flMesh.rotation.x = -Math.PI / 2;
-flMesh.receiveShadow = true;
-scene.add(flMesh);
-const gridH = new THREE.GridHelper(60, 30, 0x333355, 0x222240);
-gridH.position.set(0, 0.01, 0);
-scene.add(gridH);
+const sun = new THREE.DirectionalLight(0xffeedd, 1.8);
+sun.position.set(100, 150, 80);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+const sc = sun.shadow.camera;
+sc.near = 1; sc.far = 500; sc.left = -150; sc.right = 150; sc.top = 150; sc.bottom = -150;
+scene.add(sun);
 
-/* ── CONTACT DEBUG GROUP ──────────────────────────── */
+const fill = new THREE.DirectionalLight(0xffaa88, 0.6);
+fill.position.set(-80, 60, -60);
+scene.add(fill);
+
+/* ── CONTACT DEBUG GROUP ───────────────────────────────── */
 const contactGroup = new THREE.Group();
 scene.add(contactGroup);
 
-/* ── CONSTANTS ─────────────────────────────────────── */
+/* ── CONSTANTS ──────────────────────────────────────────── */
 const GRAVITY = -9.81;
 const SUBSTEPS = 20;
 const BAUMGARTE = 0.2;
 const SLOP = 0.02;
 
-/* ── BODY ──────────────────────────────────────────── */
+/* ── BODY ───────────────────────────────────────────────── */
 class Body {
   constructor({ x=0, y=0, z=0, w=1, h=1, d=1, mass=1,
-                 restitution=0.4, friction=0.3, isStatic=false, color=0x888888 }) {
+                 restitution=0.4, friction=0.3, isStatic=false, color=0x888888,
+                 roughness=0.4, metalness=0.15, visible=true }) {
     this.pos = new THREE.Vector3(x, y, z);
     this.quat = new THREE.Quaternion();
     this.w = w; this.h = h; this.d = d;
     this.vx = 0; this.vy = 0; this.vz = 0;
-    this.omega = new THREE.Vector3();               // angular velocity (world-frame)
+    this.omega = new THREE.Vector3();
     this.mass = mass;
     this.invMass = isStatic ? 0 : 1 / mass;
     this.restitution = restitution;
     this.friction = friction;
     this.isStatic = isStatic;
+    this.visible = visible;
 
     const { w:ww, h:hh, d:dd } = this;
     if (!isStatic) {
@@ -113,10 +113,11 @@ class Body {
 
     this.mesh = new THREE.Mesh(
       new THREE.BoxGeometry(w, h, d),
-      new THREE.MeshStandardMaterial({ color, roughness: 0.4, metalness: 0.15 })
+      new THREE.MeshStandardMaterial({ color, roughness, metalness })
     );
     this.mesh.castShadow = true;
     this.mesh.receiveShadow = true;
+    this.mesh.visible = visible;
     scene.add(this.mesh);
   }
 
@@ -124,7 +125,6 @@ class Body {
   aabb() {
     const hw = this.w / 2, hh = this.h / 2, hd = this.d / 2;
     const q = this.quat;
-    // rotated local axes
     const dirs = [
       new THREE.Vector3(1,0,0), new THREE.Vector3(0,1,0), new THREE.Vector3(0,0,1)
     ].map(a => a.clone().applyQuaternion(q));
@@ -146,7 +146,6 @@ class Body {
     return { minX, maxX, minY, maxY, minZ, maxZ, dirs, exts, center };
   }
 
-  // 8 world-space vertices
   vertices() {
       const v = [];
       const s = [-1, 1];
@@ -165,48 +164,137 @@ class Body {
   }
 }
 
-/* ── BODIES ────────────────────────────────────────── */
+/* ── BODIES ─────────────────────────────────────────────── */
 const bodies = [];
-const palette = [
-  0xe06070,0xe0a040,0x50b060,0x5090e0,0xc070d0,
-  0x50d0d0,0xe07050,0x9080c0,0x60c080,0xd0a050,
-  0x80b060,0xd06090,0x6070d0,0xd0b060,0x70a0b0,
-  0xb070a0,0x60d0a0,0xa060d0,0xd08060,0x70c070,
-  0xb06080,0x80c0c0,0xc09050,0x6080b0,0xa090a0,
-  0x90a060,0xc06080,0x60a0c0,0xa0c060,0x80c090
-];
 
-// floor
-bodies.push(new Body({ x:0, y:-0.5, z:0, w:60, h:1, d:60, isStatic:true, color:0x222238 }));
-bodies[0].mesh.visible = false;
+// ── Ground (doomsday style: 600x600, color 0x1a1510) ─────
+bodies.push(new Body({
+  x: 0, y: -0.5, z: 0, w: 600, h: 1, d: 600,
+  isStatic: true, color: 0x1a1510, roughness: 0.95, metalness: 0.05, visible: true
+}));
 
-// walls
-const WD=16, WH=30;
-[[-WD,WH/2,0,0.4,WH,WD*2],[WD,WH/2,0,0.4,WH,WD*2],
- [0,WH/2,-WD,WD*2,WH,0.4],[0,WH/2,WD,WD*2,WH,0.4]
-].forEach(([x,y,z,w,h,d])=>{
-  const b=new Body({x,y,z,w,h,d,isStatic:true,color:0x222238});
-  b.mesh.visible=false; bodies.push(b);
-});
-
-function spawnBlock(x, y, z, size) {
-  const b = new Body({
-    x,y,z, w:size,h:size,d:size, mass:size*size*size,
-    restitution:0.35+Math.random()*0.25,
-    friction:0.3+Math.random()*0.2,
-    color: palette[bodies.length%palette.length]
-  });
-  b.omega.set((Math.random()-.5)*3,(Math.random()-.5)*3,(Math.random()-.5)*3);
-  bodies.push(b);
+// ── Roads: grid of 5x5, spacing 35, width 5 ─────────────
+const roadColor = 0x1a1a1a;
+for (let i = -2; i <= 2; i++) {
+  // horizontal roads
+  bodies.push(new Body({
+    x: 0, y: 0.02, z: i * 35, w: 600, h: 0.04, d: 5,
+    isStatic: true, color: roadColor, roughness: 0.8, metalness: 0.0, visible: true
+  }));
+  // vertical roads
+  bodies.push(new Body({
+    x: i * 35, y: 0.02, z: 0, w: 5, h: 0.04, d: 600,
+    isStatic: true, color: roadColor, roughness: 0.8, metalness: 0.0, visible: true
+  }));
 }
 
-let idx=0;
-for (const n of [100,6,5,5,4,4,3,2,2,1,1])
-  for (let i=0;i<n&&idx<100;i++,idx++)
-    spawnBlock((Math.random()-.5)*6, 4+idx*1.4, (Math.random()-.5)*3, 0.5+Math.random()*0.6);
+// ── Building color palette (doomsday steel blues) ────────
+const buildingPalette = [
+  0x3a4a5a, 0x4a5a6a, 0x3d4d5d, 0x455565, 0x506070,
+  0x3a3a4a, 0x4a4a5a, 0x5a6a7a, 0x334353, 0x445464
+];
 
-/* ── SAT OBB vs OBB (Gottschalk — up to 4 contacts) ── */
-// const SAT_EPS = 1e-6;
+const blockHeight = 2.5;
+
+/* ── Create a building from stacked Body blocks ────────── */
+function createBuilding(cx, cz, w, d, h, color) {
+  const floors = Math.max(3, Math.ceil(h / blockHeight));
+  const baseColor = new THREE.Color(color);
+
+  for (let f = 0; f < floors; f++) {
+    const y = f * blockHeight + blockHeight / 2;
+    const subdivisions = w > 7 ? 2 : 1;
+    const subW = w / subdivisions;
+
+    for (let s = 0; s < subdivisions; s++) {
+      const sx = cx - w / 2 + s * subW + subW / 2;
+      const sz = cz;
+
+      // Slight color variation per floor
+      const floorColor = baseColor.clone();
+      floorColor.offsetHSL(0, (Math.random() - 0.5) * 0.05, (Math.random() - 0.5) * 0.05);
+
+      const bw = subW - 0.15;
+      const bh = blockHeight - 0.1;
+      const bd = d - 0.15;
+
+      const mass = bw * bd * bh * 0.5;
+      bodies.push(new Body({
+        x: sx, y: y, z: sz,
+        w: bw, h: bh, d: bd,
+        mass: mass,
+        restitution: 0.05,
+        friction: 0.9,
+        color: Math.floor(floorColor.getHex()),
+        roughness: 0.75,
+        metalness: 0.15,
+        visible: true
+      }));
+    }
+  }
+
+  // Rooftop antenna for tall buildings (floors > 10)
+  if (floors > 10 && Math.random() > 0.3) {
+    const antennaH = 3 + Math.random() * 6;
+    const antennaMass = 0.5;
+    bodies.push(new Body({
+      x: cx, y: floors * blockHeight + antennaH / 2, z: cz,
+      w: 0.2, h: antennaH, d: 0.2,
+      mass: antennaMass,
+      restitution: 0.2,
+      friction: 0.7,
+      color: 0x777777,
+      roughness: 0.2,
+      metalness: 0.8,
+      visible: true
+    }));
+  }
+}
+
+/* ── Construct the city grid ───────────────────────────── */
+const grid = 35;
+const half = 1; // 3x3 grid to keep block count < 500
+
+// Seeded random for reproducibility
+let seed = 42;
+function seededRandom() {
+  seed = (seed * 16807 + 0) % 2147483647;
+  return (seed - 1) / 2147483646;
+}
+
+for (let gx = -half; gx <= half; gx++) {
+  for (let gz = -half; gz <= half; gz++) {
+    const distFromCenter = Math.sqrt(gx * gx + gz * gz);
+    if (distFromCenter < 0.5) continue; // blast zone — center skipped
+
+    const count = 1 + Math.floor(seededRandom() * 2);
+    for (let b = 0; b < count; b++) {
+      const bx = gx * grid + (seededRandom() - 0.5) * 15 + 4;
+      const bz = gz * grid + (seededRandom() - 0.5) * 15 + 4;
+      const bw = 5 + seededRandom() * 8;
+      const bd = 5 + seededRandom() * 8;
+      const bh = 10 + seededRandom() * 25;
+
+      const color = buildingPalette[Math.floor(seededRandom() * buildingPalette.length)];
+      createBuilding(bx, bz, bw, bd, bh, color);
+    }
+  }
+}
+
+// ── Skyscrapers: 3 tall buildings at 70-90 units from center ─
+for (let i = 0; i < 3; i++) {
+  const a = seededRandom() * Math.PI * 2;
+  const r = 70 + seededRandom() * 20;
+  createBuilding(
+    Math.cos(a) * r, Math.sin(a) * r,
+    8 + seededRandom() * 5, 8 + seededRandom() * 5,
+    25 + seededRandom() * 15, 0x556677
+  );
+}
+
+document.getElementById('count').textContent = bodies.length;
+
+/* ── SAT OBB vs OBB (Gottschalk — up to 4 contacts) ──── */
 const SAT_EPS = 5e-4;
 const JL_TINY = 1e-7;
 const JL_TOLERANCE = 1e-4;
@@ -221,7 +309,6 @@ function satOBB(a, b) {
   const axesB = [new THREE.Vector3(1,0,0),new THREE.Vector3(0,1,0),new THREE.Vector3(0,0,1)]
     .map(v=>v.clone().applyQuaternion(b.quat));
 
-  // R matrix — reused across all 15 axis tests
   const R=[[0,0,0],[0,0,0],[0,0,0]], AbsR=[[0,0,0],[0,0,0],[0,0,0]];
   for(let i=0;i<3;i++) for(let j=0;j<3;j++){
     R[i][j]=axesA[i].dot(axesB[j]); AbsR[i][j]=Math.abs(R[i][j])+SAT_EPS;
@@ -229,15 +316,12 @@ function satOBB(a, b) {
 
   const t = new THREE.Vector3().subVectors(b.pos, a.pos);
   const tA = new THREE.Vector3(t.dot(axesA[0]),t.dot(axesA[1]),t.dot(axesA[2]));
-  // const tB = new THREE.Vector3(t.dot(axesB[0]),t.dot(axesB[1]),t.dot(axesB[2]));
 
   let bestPen=Infinity, bestAxis=new THREE.Vector3(), bestCase=-1, bestI=0, bestJ=0;
   let bestPenF = Infinity, bestAxisF = new THREE.Vector3(), bestCaseF = -1;
-  // 0-2 face A, 3-5 face B, 6-14 edge-edge
-
 
   function test(L,pen,cid,i,j,biasFace){
-    const biased=biasFace?pen:pen+1e-4;           // face bias
+    const biased=biasFace?pen:pen+1e-4;
     if(biased<bestPen){
       bestPen=biased; bestAxis.copy(L);
       if(L.dot(t)<0) bestAxis.negate();
@@ -250,22 +334,18 @@ function satOBB(a, b) {
     }
   }
 
-  // Face axes of A
   for(let i=0;i<3;i++){
     const rA=hA[i], rB=hB[0]*AbsR[i][0]+hB[1]*AbsR[i][1]+hB[2]*AbsR[i][2];
     const pen=rA+rB-Math.abs(tA.getComponent(i));
     if(pen<0) return null;
     test(axesA[i],pen,i,i,0,true);
   }
-  // Face axes of B
   for(let j=0;j<3;j++){
     const rA=hA[0]*AbsR[0][j]+hA[1]*AbsR[1][j]+hA[2]*AbsR[2][j], rB=hB[j];
-    // const pen=rA+rB-Math.abs(tB.getComponent(j));
     const pen = rA+rB-Math.abs(tA.x*R[0][j] + tA.y*R[1][j] + tA.z*R[2][j]);
     if(pen<0) return null;
     test(axesB[j],pen,3+j,0,j,true);
   }
-  // Edge-edge axes (Gottschalk)
   for(let i=0;i<3;i++) for(let j=0;j<3;j++){
     const L=new THREE.Vector3().crossVectors(axesA[i],axesB[j]);
     const len2=L.lengthSq(); if(len2<1e-8) continue;
@@ -273,12 +353,8 @@ function satOBB(a, b) {
     let i1=(i+1)%3,i2=(i+2)%3,j1=(j+1)%3,j2=(j+2)%3;
     const ii1=(i+2)%3, ii2=(i+1)%3;
     const jj1=i1, jj2=i2;
-    if (j == 1) {
-        const tmp = j1;    j1 = j2;     j2 = tmp;
-    }
-    if (i == 1) {
-        const tmp = i1;    i1 = i2;     i2 = tmp;
-    }
+    if (j == 1) { const tmp = j1; j1 = j2; j2 = tmp; }
+    if (i == 1) { const tmp = i1; i1 = i2; i2 = tmp; }
     const rA=hA[i1]*AbsR[i2][j]+hA[i2]*AbsR[i1][j];
     const rB=hB[j1]*AbsR[i][j2]+hB[j2]*AbsR[i][j1];
     const dist = Math.abs(tA.getComponent(ii1)*R[jj1][j] - tA.getComponent(ii2)*R[jj2][j]);
@@ -303,20 +379,15 @@ function _cornerInside(outer, verts, axes, h) {
   for (const v in verts) {
     const d = new THREE.Vector3().subVectors(verts[v], outer.pos);
     const local = new THREE.Vector3(
-        d.dot(axes[0]),
-        d.dot(axes[1]),
-        d.dot(axes[2])
+        d.dot(axes[0]), d.dot(axes[1]), d.dot(axes[2])
     );
     if (Math.abs(local.x) <= h[0] + JL_TOLERANCE &&
         Math.abs(local.y) <= h[1] + JL_TOLERANCE &&
-        Math.abs(local.z) <= h[2] + JL_TOLERANCE) {
-        return true;
-    }
+        Math.abs(local.z) <= h[2] + JL_TOLERANCE) return true;
   }
   return false;
 }
 
-/* ── edge-edge: closest pts on two segments ─────── */
 function supportEdge(pos,axes,h,axisIdx,dir){
   const i1=(axisIdx+1)%3, i2=(axisIdx+2)%3;
   const s1=Math.sign(axes[i1].dot(dir))||1, s2=Math.sign(axes[i2].dot(dir))||1;
@@ -353,7 +424,6 @@ function edgeEdgeContact(bodyA,bodyB,axesA,axesB,hA,hB,iA,iB,normal,depth){
   return{normal:normal.clone(),depth,contacts:[{position:c,depth}]};
 }
 
-/* ── face contact: Sutherland–Hodgman clipping ──── */
 function faceContact(bodyA,bodyB,axesA,axesB,hA,hB,normal,depth,refIsA){
   const refAxes=refIsA?axesA:axesB, incAxes=refIsA?axesB:axesA;
   const refH=refIsA?hA:hB,       incH=refIsA?hB:hA;
@@ -379,7 +449,6 @@ function faceContact(bodyA,bodyB,axesA,axesB,hA,hB,normal,depth,refIsA){
     }
   }
   if(contacts.length===0) return{normal:normal.clone(),depth,contacts:[{position:refFace.vertices[0].clone(),depth}]};
-
   return{normal:normal.clone(),depth,contacts:reduceManifold(contacts,refIsA?normal: normal.clone().negate())};
 }
 
@@ -434,14 +503,11 @@ function reduceManifold(contacts,normal){
   return p3?[p0,p1,p2,p3]:[p0,p1,p2];
 }
 
-
-
-/* ── IMPULSE RESOLUTION (multi-contact) ──────────── */
+/* ── IMPULSE RESOLUTION (multi-contact) ───────────────── */
 function resolve(a, b, man) {
   const n = man.normal;
-  const contacts = man.contacts;          // [{position, depth}, …]
+  const contacts = man.contacts;
 
-  // positional correction (once, using deepest contact)
   const deepest = contacts.reduce((d,c)=>c.depth>d.depth?c:d, contacts[0]);
   const corrMag = Math.max(deepest.depth - SLOP, 0) / (a.invMass + b.invMass) * BAUMGARTE;
   const cp = n.clone().multiplyScalar(corrMag);
@@ -452,24 +518,20 @@ function resolve(a, b, man) {
     const l = wv.clone().applyQuaternion(body.quat.clone().invert());
     return l.x*l.x*body.invIX + l.y*l.y*body.invIY + l.z*l.z*body.invIZ;
   }
-  /** Angular impulse: tau (world) → local frame → scale by invInertia diagonal → back to world */
+
   function applyAngularImpulse(body, tau, sign) {
-    // const local = tau.clone().applyQuaternion(body.quat.conjugate());
     const local = tau.clone().applyQuaternion(body.quat.clone().invert());
     local.x *= body.invIX; local.y *= body.invIY; local.z *= body.invIZ;
     const worldDelta = local.applyQuaternion(body.quat);
     if (sign < 0) body.omega.sub(worldDelta); else body.omega.add(worldDelta);
   }
 
-   /** Effective inverse mass + rotational inertia contribution along axis */
-    function invEffectiveMass(body, rxAxis) {
-      // const rxAxis = r.clone().cross(axis);
-      // const local = rxAxis.clone().applyQuaternion(body.quat.conjugate());
-      const local = rxAxis.clone().applyQuaternion(body.quat.clone().invert());
-      return body.invMass + local.x * local.x * body.invIX
+  function invEffectiveMass(body, rxAxis) {
+    const local = rxAxis.clone().applyQuaternion(body.quat.clone().invert());
+    return body.invMass + local.x * local.x * body.invIX
                                 + local.y * local.y * body.invIY
                                 + local.z * local.z * body.invIZ;
-    }
+  }
 
   for (const ct of contacts) {
     const c  = ct.position;
@@ -485,8 +547,7 @@ function resolve(a, b, man) {
     if (vn > 0) continue;
 
     const rAxN=rA.clone().cross(n), rBxN=rB.clone().cross(n);
-      const invME = invEffectiveMass(a, rAxN) + invEffectiveMass(b, rBxN);
-    // const invME = a.invMass+angMass(a,rAxN) + b.invMass+angMass(b,rBxN);
+    const invME = invEffectiveMass(a, rAxN) + invEffectiveMass(b, rBxN);
     if (invME<1e-10) continue;
 
     const e = Math.min(a.restitution,b.restitution);
@@ -497,24 +558,20 @@ function resolve(a, b, man) {
     if (a.invMass) {
       a.vx-=imp.x*a.invMass; a.vy-=imp.y*a.invMass; a.vz-=imp.z*a.invMass;
       const tau=rA.clone().cross(imp);
-      // a.omega.x-=tau.x*a.invIX; a.omega.y-=tau.y*a.invIY; a.omega.z-=tau.z*a.invIZ;
       applyAngularImpulse(a, tau, -1);
     }
     if (b.invMass) {
       b.vx+=imp.x*b.invMass; b.vy+=imp.y*b.invMass; b.vz+=imp.z*b.invMass;
       const tau=rB.clone().cross(imp);
-      // b.omega.x+=tau.x*b.invIX; b.omega.y+=tau.y*b.invIY; b.omega.z+=tau.z*b.invIZ;
       applyAngularImpulse(b, tau, 1);
     }
 
-    // friction at this contact
     const va2=new THREE.Vector3(a.vx+a.omega.y*rA.z-a.omega.z*rA.y,a.vy+a.omega.z*rA.x-a.omega.x*rA.z,a.vz+a.omega.x*rA.y-a.omega.y*rA.x);
     const vb2=new THREE.Vector3(b.vx+b.omega.y*rB.z-b.omega.z*rB.y,b.vy+b.omega.z*rB.x-b.omega.x*rB.z,b.vz+b.omega.x*rB.y-b.omega.y*rB.x);
     let tan=vb2.clone().sub(va2).sub(n.clone().multiplyScalar(vb2.clone().sub(va2).dot(n)));
     const tl=tan.length(); if(tl<1e-6) continue;
     tan.normalize();
     const rAxT=rA.clone().cross(tan), rBxT=rB.clone().cross(tan);
-    // const invME2=a.invMass+angMass(a,rAxT)+b.invMass+angMass(b,rBxT);
     const invME2 = invEffectiveMass(a, rAxT) + invEffectiveMass(b, rBxT);
     if(invME2<1e-10) continue;
     let jt=-vb2.clone().sub(va2).dot(tan)/invME2;
@@ -524,19 +581,17 @@ function resolve(a, b, man) {
     if (a.invMass) {
       a.vx-=fi.x*a.invMass; a.vy-=fi.y*a.invMass; a.vz-=fi.z*a.invMass;
       const tau=rA.clone().cross(fi);
-      // a.omega.x-=tau.x*a.invIX; a.omega.y-=tau.y*a.invIY; a.omega.z-=tau.z*a.invIZ;
       applyAngularImpulse(a, tau, -1);
     }
     if (b.invMass) {
       b.vx+=fi.x*b.invMass; b.vy+=fi.y*b.invMass; b.vz+=fi.z*b.invMass;
       const tau=rB.clone().cross(fi);
-      // b.omega.x+=tau.x*b.invIX; b.omega.y+=tau.y*b.invIY; b.omega.z+=tau.z*b.invIZ;
       applyAngularImpulse(b, tau, 1);
     }
   }
 }
 
-/* ── SPATIAL HASH ────────────────────────────────── */
+/* ── SPATIAL HASH ──────────────────────────────────────── */
 class Grid {
   constructor(cs=2){ this.cs=cs; this.cells=new Map(); }
   clear(){ this.cells.clear(); }
@@ -565,19 +620,19 @@ class Grid {
     return s;
   }
 }
-const g = new Grid(2);
+
+// Larger cell size for the bigger city
+const g = new Grid(8);
 let _lastManifolds = [];
 
-/* ── PHYSICS STEP ────────────────────────────────── */
+/* ── PHYSICS STEP ──────────────────────────────────────── */
 function step(dt, s) {
-  // 1. Integrate
   for (const b of bodies) {
     if (b.isStatic) continue;
     b.vy += GRAVITY * dt;
     b.pos.x += b.vx * dt;
     b.pos.y += b.vy * dt;
     b.pos.z += b.vz * dt;
-    // quaternion integration: dq = 0.5 * omega_q * q * dt
     const ox=b.omega.x*0.5, oy=b.omega.y*0.5, oz=b.omega.z*0.5, ow=0;
     const qx=b.quat.x, qy=b.quat.y, qz=b.quat.z, qw=b.quat.w;
     const dqx = ow*qx + ox*qw + oy*qz - oz*qy;
@@ -589,11 +644,9 @@ function step(dt, s) {
     b.quat.normalize();
   }
 
-  // 2. Broad phase
   g.clear();
   for (const b of bodies) g.insert(b);
 
-  // 3. Narrow phase + resolve
   const seen = new Set();
   for (let i = 0; i < bodies.length; i++) {
     const a = bodies[i];
@@ -611,7 +664,8 @@ function step(dt, s) {
     }
   }
 
-  // 4. CCD safety net — clamp tunneling through floor
+  // CCD safety net
+  const FLOOR_Y = 0;
   for (const b of bodies) {
     if (b.isStatic) continue;
     const a = b.aabb();
@@ -621,7 +675,7 @@ function step(dt, s) {
     }
   }
 
-  // 5. Damping + sleep
+  // Damping + sleep
   for (const b of bodies) {
     if (b.isStatic) continue;
     const s2 = b.vx*b.vx+b.vy*b.vy+b.vz*b.vz;
@@ -636,7 +690,7 @@ function step(dt, s) {
   }
 }
 
-/* ── DRAW CONTACTS (ported from boxbox.html) ─────── */
+/* ── DRAW CONTACTS ─────────────────────────────────────── */
 const _sphGeo = new THREE.SphereGeometry(0.06, 8, 8);
 const _sphMat = new THREE.MeshBasicMaterial({ color: 0xff2222 });
 
@@ -670,11 +724,10 @@ function drawContacts(manifolds) {
   }
 }
 
-/* ── RENDER ──────────────────────────────────────── */
+/* ── RENDER LOOP ───────────────────────────────────────── */
 const clock = new THREE.Clock();
 let fc=0, ft=0;
 const fpsEl = document.getElementById('fps');
-const countEl = document.getElementById('count');
 
 function animate() {
   requestAnimationFrame(animate);
@@ -692,20 +745,13 @@ function animate() {
     b.mesh.position.copy(b.pos);
     b.mesh.quaternion.copy(b.quat);
   }
-  countEl.textContent = bodies.length;
+
   controls.update();
   renderer.render(scene, camera);
 }
 animate();
 
-renderer.domElement.addEventListener('click', () => {
-  // spawnBlock((Math.random()-.5)*8, 10+Math.random()*6, (Math.random()-.5)*4, 0.5+Math.random()*0.6);
-});
-
-window.addEventListener('keydown',function(e){
-  if(e.code==='Space'){e.preventDefault();spawnBlock((Math.random()-.5)*8, 10+Math.random()*6, (Math.random()-.5)*4, 0.5+Math.random()*0.6);}
-  });
-
+/* ── RESIZE ────────────────────────────────────────────── */
 window.addEventListener('resize', () => {
   camera.aspect = innerWidth/innerHeight;
   camera.updateProjectionMatrix();
