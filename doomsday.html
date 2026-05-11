@@ -1,0 +1,1060 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DOOMSDAY — Rigid Body Destruction</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #000; font-family: 'Courier New', monospace; }
+  canvas { display: block; }
+
+  #title-screen {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: radial-gradient(ellipse at center, #1a0a00 0%, #000 70%);
+    z-index: 100; transition: opacity 0.3s ease;
+  }
+  #title-screen.hidden { opacity: 0; pointer-events: none; }
+  #title-screen h1 {
+    font-size: 5em; color: #ff4400;
+    text-shadow: 0 0 30px #ff4400, 0 0 60px #ff2200, 0 0 100px #ff0000;
+    letter-spacing: 0.3em; margin-bottom: 10px; animation: pulse 2s infinite;
+  }
+  #title-screen h2 { font-size: 1.2em; color: #cc3300; letter-spacing: 0.5em; margin-bottom: 40px; }
+  #title-screen .subtitle { font-size: 0.9em; color: #886644; letter-spacing: 0.2em; margin-bottom: 50px; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.7} }
+
+  #detonate-btn {
+    pointer-events: all; padding: 20px 60px; font-size: 1.5em;
+    font-family: 'Courier New', monospace; background: transparent;
+    border: 2px solid #ff4400; color: #ff4400; cursor: pointer;
+    letter-spacing: 0.3em; text-transform: uppercase; transition: all 0.3s;
+  }
+  #detonate-btn:hover { background:#ff4400; color:#000; box-shadow:0 0 40px #ff4400; }
+
+  #flash {
+    position: fixed; top:0; left:0; width:100%; height:100%;
+    background:white; opacity:0; z-index:50; pointer-events:none; transition: opacity 0.1s;
+  }
+  #flash.active { opacity:1; }
+
+  #hud {
+    position: fixed; top:20px; left:20px; color:#ff6633; font-size:0.8em;
+    letter-spacing:0.1em; z-index:10; text-shadow:0 0 10px #ff4400;
+  }
+  #hud div { margin-bottom:5px; }
+
+  #warning {
+    position: fixed; bottom:30px; left:50%; transform:translateX(-50%);
+    color:#ff0000; font-size:1em; letter-spacing:0.3em; z-index:10; display:none;
+  }
+
+  #progress {
+    position: fixed; bottom:60px; left:50%; transform:translateX(-50%);
+    color:#ff6633; font-size:0.8em; z-index:10; display:none; text-align:center;
+  }
+</style>
+</head>
+<body>
+
+<div id="title-screen">
+  <h1>DOOMSDAY</h1>
+  <h2>Rigid Body Destruction</h2>
+  <p class="subtitle">Physics-based urban annihilation simulation</p>
+  <button id="detonate-btn" onclick="initiateDoom()">INITIATE</button>
+</div>
+
+<div id="flash"></div>
+<div id="hud">
+  <div id="hud-status">STATUS: ARMED</div>
+  <div id="hud-yield">YIELD: 20 MEGATONS</div>
+  <div id="hud-bodies">RIGID BODIES: 0</div>
+  <div id="hud-destroyed">DESTROYED: 0</div>
+</div>
+<div id="warning">⚠ NUCLEAR DETONATION IN PROGRESS ⚠</div>
+<div id="progress"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+<script>
+// ============================================================
+// DOOMSDAY — Rigid Body Atomic Destruction Simulator
+// ============================================================
+
+let scene, camera, renderer, controls;
+let world; // Cannon.js physics world
+let buildingBlocks = []; // { mesh, body, buildingGroup, originalPos, state }
+let buildingGroups = {}; // id -> { blocks, distance, destroyed }
+let debrisParticles, dustParticles, sparkParticles;
+let fireballMesh, innerFireball, shockwaveMesh, shockwaveWall;
+let mushroomCloud = [];
+let groundSmoke = [];
+let groundFire = [];
+let explosionTime = 0, explosionActive = false;
+let blastQueue = []; // { block, dist, delay }
+let totalBodies = 0, destroyedCount = 0;
+let groundBody, groundMesh;
+let clock = new THREE.Clock();
+let explosionLight, explosionLight2;
+
+// Cannon.js materials
+let groundMat, buildingMat, debrisMat;
+
+// ============================================================
+// INIT
+// ============================================================
+function init() {
+  // --- THREE.JS ---
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0a0505);
+  scene.fog = new THREE.FogExp2(0x0a0505, 0.002);
+
+  camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 2000);
+  camera.position.set(100, 80, 150);
+  camera.lookAt(0, 15, 0);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  document.body.appendChild(renderer.domElement);
+
+  controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.05;
+  controls.maxPolarAngle = Math.PI / 2.05;
+  controls.minDistance = 20;
+  controls.maxDistance = 400;
+  controls.target.set(0, 15, 0);
+
+  // --- CANNON.JS ---
+  world = new CANNON.World();
+  world.gravity.set(0, -9.82, 0);
+  world.broadphase = new CANNON.SAPBroadphase(world);
+  world.solver.iterations = 15;
+  world.allowSleep = true;
+
+  // Materials
+  groundMat = new CANNON.Material();
+  buildingMat = new CANNON.Material();
+  debrisMat = new CANNON.Material();
+
+  world.addContactMaterial(new CANNON.ContactMaterial(groundMat, buildingMat, {
+    friction: 0.8, restitution: 0.1
+  }));
+  world.addContactMaterial(new CANNON.ContactMaterial(buildingMat, buildingMat, {
+    friction: 0.9, restitution: 0.05
+  }));
+  world.addContactMaterial(new CANNON.ContactMaterial(debrisMat, buildingMat, {
+    friction: 0.7, restitution: 0.2
+  }));
+  world.addContactMaterial(new CANNON.ContactMaterial(debrisMat, groundMat, {
+    friction: 0.9, restitution: 0.1
+  }));
+  world.addContactMaterial(new CANNON.ContactMaterial(debrisMat, debrisMat, {
+    friction: 0.8, restitution: 0.15
+  }));
+
+  // Collision wake-up: ensure sleeping blocks get woken when hit
+  world.addEventListener('collide', function(e) {
+    // Cannon dispatches collide to each body; e.body is the OTHER body
+    e.body.wakeUp();
+  });
+
+  setupLighting();
+  createGround();
+  createCity();
+  createAmbientDust();
+
+  window.addEventListener('resize', onResize);
+  animate();
+}
+
+// ============================================================
+// LIGHTING
+// ============================================================
+function setupLighting() {
+  scene.add(new THREE.AmbientLight(0x221111, 0.4));
+
+  const hemi = new THREE.HemisphereLight(0x332211, 0x110a00, 0.3);
+  scene.add(hemi);
+
+  const sun = new THREE.DirectionalLight(0xffccaa, 0.7);
+  sun.position.set(100, 150, 80);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  const sc = sun.shadow.camera;
+  sc.near = 1; sc.far = 500; sc.left = -150; sc.right = 150; sc.top = 150; sc.bottom = -150;
+  scene.add(sun);
+
+  // Subtle fill
+  const fill = new THREE.DirectionalLight(0x221133, 0.2);
+  fill.position.set(-80, 60, -60);
+  scene.add(fill);
+}
+
+// ============================================================
+// GROUND
+// ============================================================
+function createGround() {
+  // Three.js ground
+  const gGeo = new THREE.PlaneGeometry(600, 600);
+  const gMat = new THREE.MeshStandardMaterial({ color: 0x1a1510, roughness: 0.95, metalness: 0.05 });
+  groundMesh = new THREE.Mesh(gGeo, gMat);
+  groundMesh.rotation.x = -Math.PI / 2;
+  groundMesh.receiveShadow = true;
+  scene.add(groundMesh);
+
+  // Cannon ground
+  groundBody = new CANNON.Body({
+    mass: 0, // static
+    material: groundMat,
+  });
+  groundBody.addShape(new CANNON.Plane());
+  groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+  world.addBody(groundBody);
+
+  // Road lines
+  const roadMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.8 });
+  for (let i = -2; i <= 2; i++) {
+    const rh = new THREE.Mesh(new THREE.PlaneGeometry(600, 5), roadMat);
+    rh.rotation.x = -Math.PI / 2; rh.position.set(0, 0.02, i * 35);
+    scene.add(rh);
+    const rv = new THREE.Mesh(new THREE.PlaneGeometry(5, 600), roadMat);
+    rv.rotation.x = -Math.PI / 2; rv.position.set(i * 35, 0.02, 0);
+    scene.add(rv);
+  }
+}
+
+// ============================================================
+// CITY — Buildings made of rigid body blocks
+// ============================================================
+function createCity() {
+  const buildingPalette = [
+    0x3a4a5a, 0x4a5a6a, 0x3d4d5d, 0x455565, 0x506070,
+    0x3a3a4a, 0x4a4a5a, 0x5a6a7a, 0x334353, 0x445464
+  ];
+
+  const grid = 35;
+  const half = 3;
+  let bodyId = 0;
+
+  document.getElementById('progress').style.display = 'block';
+  document.getElementById('progress').textContent = 'CONSTRUCTING CITY...';
+
+  setTimeout(() => {
+    for (let gx = -half; gx <= half; gx++) {
+      for (let gz = -half; gz <= half; gz++) {
+        const distFromCenter = Math.sqrt(gx * gx + gz * gz);
+        if (distFromCenter < 0.5) continue; // blast zone
+
+        const count = 1 + Math.floor(Math.random() * 2);
+        for (let b = 0; b < count; b++) {
+          const bx = gx * grid + (Math.random() - 0.5) * 15 + 4;
+          const bz = gz * grid + (Math.random() - 0.5) * 15 + 4;
+          const bw = 5 + Math.random() * 8;
+          const bd = 5 + Math.random() * 8;
+          const bh = 10 + Math.random() * 55;
+
+          const color = buildingPalette[Math.floor(Math.random() * buildingPalette.length)];
+          const groupId = bodyId;
+          createBuildingFromBlocks(bx, bz, bw, bd, bh, color, groupId);
+          bodyId++;
+        }
+      }
+    }
+
+    // Skyscrapers
+    for (let i = 0; i < 6; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const r = 70 + Math.random() * 60;
+      createBuildingFromBlocks(
+        Math.cos(a) * r, Math.sin(a) * r,
+        8 + Math.random() * 5, 8 + Math.random() * 5,
+        50 + Math.random() * 40, 0x556677, bodyId++
+      );
+    }
+
+    totalBodies = buildingBlocks.length;
+    document.getElementById('hud-bodies').textContent = `RIGID BODIES: ${totalBodies}`;
+    document.getElementById('progress').textContent = `${totalBodies} rigid bodies ready — AWAITING DETONATION`;
+  }, 50);
+}
+
+function createBuildingFromBlocks(cx, cz, w, d, h, color, groupId) {
+  // Segment building into floor-level blocks
+  const blockHeight = 2.5;
+  const floors = Math.max(3, Math.ceil(h / blockHeight));
+  const actualH = floors * blockHeight;
+
+  // Building color variation
+  const baseColor = new THREE.Color(color);
+  const groupKey = groupId.toString();
+  buildingGroups[groupKey] = {
+    blocks: [],
+    distance: Math.sqrt(cx * cx + cz * cz),
+    destroyed: false,
+    center: { x: cx, z: cz }
+  };
+
+  // Create blocks per floor, with occasional subdivision
+  for (let f = 0; f < floors; f++) {
+    const y = f * blockHeight + blockHeight / 2;
+
+    // Each floor: 1-2 blocks depending on width
+    const subdivisions = w > 7 ? 2 : 1;
+    const subW = w / subdivisions;
+
+    for (let s = 0; s < subdivisions; s++) {
+      const sx = cx - w / 2 + s * subW + subW / 2;
+      const sz = cz;
+
+      // Block geometry
+      const geo = new THREE.BoxGeometry(subW - 0.15, blockHeight - 0.1, d - 0.15);
+
+      // Slight color variation per floor
+      const floorColor = baseColor.clone();
+      floorColor.offsetHSL(0, (Math.random() - 0.5) * 0.05, (Math.random() - 0.5) * 0.05);
+
+      const mat = new THREE.MeshStandardMaterial({
+        color: floorColor,
+        roughness: 0.75,
+        metalness: 0.15,
+      });
+
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+
+      // Cannon body — sleeping initially
+      const body = new CANNON.Body({
+        mass: subW * d * blockHeight * 0.5, // density-based mass
+        material: buildingMat,
+        sleepSpeedLimit: 0.1, // wake on tiny movement
+        sleepTimeLimit: 0.05, // wake almost instantly
+        linearDamping: 0.3,
+        angularDamping: 0.5,
+        collisionResponse: true,
+        fixedRotation: false,
+      });
+      body.addShape(new CANNON.Box(new CANNON.Vec3(subW / 2 - 0.075, blockHeight / 2 - 0.05, d / 2 - 0.075)));
+      body.position.set(sx, y, sz);
+      body.sleep();
+      world.addBody(body);
+
+      const blockData = {
+        mesh, body, groupId: groupKey,
+        originalPos: { x: sx, y: y, z: sz },
+        originalQuat: body.quaternion.clone(),
+        state: 'SLEEPING', // SLEEPING, WAKING, FLYING, RESTED
+        floorIndex: f,
+      };
+      buildingBlocks.push(blockData);
+      buildingGroups[groupKey].blocks.push(blockData);
+
+      // Window texture on front/back faces (emissive overlay)
+      createWindowOverlay(mesh, sx, y, sz, subW, blockHeight, d);
+    }
+  }
+
+  // Rooftop antenna for tall buildings
+  if (floors > 10 && Math.random() > 0.3) {
+    const antennaH = 3 + Math.random() * 6;
+    const aGeo = new THREE.CylinderGeometry(0.1, 0.15, antennaH, 6);
+    const aMat = new THREE.MeshStandardMaterial({ color: 0x777777, metalness: 0.8 });
+    const antenna = new THREE.Mesh(aGeo, aMat);
+    antenna.position.set(cx, actualH + antennaH / 2, cz);
+    antenna.castShadow = true;
+    scene.add(antenna);
+
+    // Antenna as small rigid body
+    const aBody = new CANNON.Body({
+      mass: 0.5,
+      material: debrisMat,
+      sleepSpeedLimit: 0.1,
+      sleepTimeLimit: 0.05,
+      linearDamping: 0.3,
+      angularDamping: 0.5,
+    });
+    aBody.addShape(new CANNON.Box(new CANNON.Vec3(0.1, antennaH / 2, 0.1)));
+    aBody.position.copy(antenna.position);
+    aBody.sleep();
+    world.addBody(aBody);
+
+    buildingBlocks.push({
+      mesh: antenna, body: aBody, groupId: groupKey,
+      originalPos: { x: cx, y: actualH + antennaH / 2, z: cz },
+      originalQuat: aBody.quaternion.clone(),
+      state: 'SLEEPING', floorIndex: floors,
+    });
+    buildingGroups[groupKey].blocks.push(buildingBlocks[buildingBlocks.length - 1]);
+  }
+}
+
+function createWindowOverlay(parentMesh, sx, y, sz, w, h, d) {
+  // Glowing window strips
+  const winMat = new THREE.MeshBasicMaterial({
+    color: 0x8899aa, transparent: true, opacity: 0.15,
+    depthWrite: false, side: THREE.DoubleSide,
+  });
+
+  // Front
+  const wf = new THREE.Mesh(new THREE.PlaneGeometry(w - 0.3, h - 0.3), winMat);
+  wf.position.set(0, 0, d / 2 + 0.06);
+  parentMesh.add(wf);
+
+  // Back
+  const wb = wf.clone();
+  wb.position.z = -d / 2 - 0.06;
+  parentMesh.add(wb);
+
+  // Sides
+  const ws = new THREE.Mesh(new THREE.PlaneGeometry(d - 0.3, h - 0.3), winMat);
+  ws.position.set(-w / 2 - 0.06, 0, 0);
+  ws.rotation.y = -Math.PI / 2;
+  parentMesh.add(ws);
+
+  const wr = ws.clone();
+  wr.position.x = w / 2 + 0.06;
+  wr.rotation.y = Math.PI / 2;
+  parentMesh.add(wr);
+}
+
+// ============================================================
+// AMBIENT DUST (pre-explosion)
+// ============================================================
+function createAmbientDust() {
+  const count = 300;
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    pos[i * 3] = (Math.random() - 0.5) * 300;
+    pos[i * 3 + 1] = Math.random() * 50;
+    pos[i * 3 + 2] = (Math.random() - 0.5) * 300;
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({
+    color: 0x554433, size: 2, transparent: true, opacity: 0.1, depthWrite: false,
+  });
+  const p = new THREE.Points(geo, mat);
+  scene.add(p);
+}
+
+// ============================================================
+// EXPLOSION
+// ============================================================
+function initiateDoom() {
+  const title = document.getElementById('title-screen');
+  title.classList.add('hidden');
+  setTimeout(() => {
+    title.style.display = 'none';
+    document.getElementById('hud').style.display = 'block';
+    document.getElementById('warning').style.display = 'block';
+  }, 100);
+  setTimeout(detonate, 300);
+}
+
+function detonate() {
+  explosionActive = true;
+  explosionTime = 0;
+
+  document.getElementById('hud-status').textContent = 'STATUS: DETONATED';
+  document.getElementById('hud-status').style.color = '#ff0000';
+  document.getElementById('progress').style.display = 'none';
+
+  // Flash
+  const flash = document.getElementById('flash');
+  flash.classList.add('active');
+  setTimeout(() => flash.classList.remove('active'), 150);
+
+  createFireball();
+  createShockwave();
+  createMushroomCloud();
+  createDebrisBurst();
+  createSparkBurst();
+  createGroundSmoke();
+  createGroundFire();
+
+  // Explosion lights
+  explosionLight = new THREE.PointLight(0xff4400, 80, 500);
+  explosionLight.position.set(0, 5, 0);
+  scene.add(explosionLight);
+
+  explosionLight2 = new THREE.PointLight(0xffaa44, 40, 300);
+  explosionLight2.position.set(0, 3, 0);
+  scene.add(explosionLight2);
+
+  scene.background = new THREE.Color(0x441100);
+  scene.fog = new THREE.FogExp2(0x331100, 0.003);
+
+  // --- WAKE UP AND APPLY BLAST FORCE ---
+  applyBlastForce();
+}
+
+function applyBlastForce() {
+  const blastPower = 150;
+  const blastRadius = 200;
+
+  // Queue every block with a time delay proportional to distance
+  // Closer blocks explode first → debris hits neighbors → chain reaction
+  buildingBlocks.forEach(block => {
+    const dx = block.body.position.x;
+    const dz = block.body.position.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+
+    if (dist > blastRadius) return; // outside blast zone — untouched
+
+    const falloff = Math.pow(Math.max(0, 1 - dist / blastRadius), 2);
+
+    // Stagger: 0s at center → up to 0.2s at edge (very fast sweep)
+    const delay = (dist / blastRadius) * 0.2;
+
+    blastQueue.push({
+      block,
+      dist,
+      delay,
+      falloff,
+      forceMag: blastPower * falloff / (dist * 0.5 + 1),
+    });
+  });
+
+  // Sort by delay so we process in order
+  blastQueue.sort((a, b) => a.delay - b.delay);
+  console.log(`Blast queued for ${blastQueue.length} rigid bodies`);
+}
+
+// Chain reaction: when a block falls and hits nearby sleeping blocks,
+// those blocks also collapse — creates a domino effect across the city
+function propagateChainReaction() {
+  // Only check every other frame for performance
+  // Run chain reaction every frame for faster propagation
+
+  const flyingBlocks = buildingBlocks.filter(b => b.state === 'FLYING');
+  const sleepingBlocks = buildingBlocks.filter(b => b.state === 'SLEEPING');
+
+  for (let i = 0; i < flyingBlocks.length; i++) {
+    const block = flyingBlocks[i];
+    const body = block.body;
+    const vel = body.velocity.length();
+    if (vel < 0.05) continue; // trigger chain reaction on even tiny movement
+
+    for (let j = 0; j < sleepingBlocks.length; j++) {
+      const neighbor = sleepingBlocks[j];
+      const nBody = neighbor.body;
+
+      // Quick distance check — same grid cell
+      const dx = body.position.x - nBody.position.x;
+      const dz = body.position.z - nBody.position.z;
+      if (Math.abs(dx) > 25 || Math.abs(dz) > 25) continue;
+
+      const dy = body.position.y - nBody.position.y;
+      const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+      if (dist < 20) {
+        nBody.wakeUp();
+        neighbor.state = 'FLYING';
+        neighbor.heatLevel = Math.max(0.05, 0.5 * (1 - dist / 20));
+
+        // Transfer strong momentum from the flying block
+        const tf = 0.6 * (1 - dist / 20);
+        const impulse = new CANNON.Vec3(
+          body.velocity.x * tf,
+          Math.abs(body.velocity.y) * tf * 0.3,
+          body.velocity.z * tf
+        );
+        nBody.applyImpulse(impulse, nBody.position);
+      }
+    }
+  }
+}
+
+function processBlastQueue() {
+  if (blastQueue.length === 0) return;
+
+  // Process all blocks whose delay has elapsed
+  while (blastQueue.length > 0 && blastQueue[0].delay <= explosionTime) {
+    const entry = blastQueue.shift();
+    const { block, dist, falloff, forceMag } = entry;
+
+    if (block.state !== 'SLEEPING') continue; // already destroyed
+
+    const dx = block.body.position.x;
+    const dz = block.body.position.z;
+    const safeDist = Math.max(dist, 0.5);
+    const dirX = dx / safeDist;
+    const dirZ = dz / safeDist;
+    const heightFactor = Math.max(0.3, 1 - block.body.position.y / 80);
+    const dirY = 0.3 + heightFactor * 0.7;
+
+    const impulse = new CANNON.Vec3(
+      dirX * forceMag + (Math.random() - 0.5) * forceMag * 0.15,
+      dirY * forceMag * 0.6 + Math.random() * forceMag * 0.2,
+      dirZ * forceMag + (Math.random() - 0.5) * forceMag * 0.15
+    );
+
+    const applicationPoint = new CANNON.Vec3(
+      block.body.position.x + (Math.random() - 0.5) * 2,
+      block.body.position.y + (Math.random() - 0.5) * 2,
+      block.body.position.z + (Math.random() - 0.5) * 2
+    );
+
+    block.body.wakeUp();
+    block.body.applyImpulse(impulse, applicationPoint);
+    block.state = 'FLYING';
+    block.heatLevel = Math.min(1, falloff);
+  }
+}
+
+// ============================================================
+// VISUAL EFFECTS
+// ============================================================
+function createFireball() {
+  const geo = new THREE.SphereGeometry(3, 32, 32);
+  const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 1 });
+  fireballMesh = new THREE.Mesh(geo, mat);
+  fireballMesh.position.set(0, 2, 0);
+  scene.add(fireballMesh);
+
+  const iGeo = new THREE.SphereGeometry(2, 32, 32);
+  const iMat = new THREE.MeshBasicMaterial({ color: 0xffffcc, transparent: true, opacity: 1 });
+  innerFireball = new THREE.Mesh(iGeo, iMat);
+  innerFireball.position.copy(fireballMesh.position);
+  scene.add(innerFireball);
+}
+
+function createShockwave() {
+  // Ground ring
+  const ringGeo = new THREE.RingGeometry(1, 6, 64);
+  const ringMat = new THREE.MeshBasicMaterial({
+    color: 0xffaa44, transparent: true, opacity: 0.7, side: THREE.DoubleSide, depthWrite: false,
+  });
+  shockwaveMesh = new THREE.Mesh(ringGeo, ringMat);
+  shockwaveMesh.rotation.x = -Math.PI / 2;
+  shockwaveMesh.position.y = 2;
+  scene.add(shockwaveMesh);
+
+  // Vertical wall
+  const wallGeo = new THREE.CylinderGeometry(1, 1, 1, 64, 1, true);
+  const wallMat = new THREE.MeshBasicMaterial({
+    color: 0xff8833, transparent: true, opacity: 0.25, side: THREE.DoubleSide, depthWrite: false,
+  });
+  shockwaveWall = new THREE.Mesh(wallGeo, wallMat);
+  shockwaveWall.position.y = 5;
+  scene.add(shockwaveWall);
+}
+
+function createMushroomCloud() {
+  const cloudColors = [0x884422, 0x663311, 0x553322, 0x775533, 0x442211, 0x996633];
+
+  // Stem particles
+  for (let i = 0; i < 30; i++) {
+    const size = 2 + Math.random() * 3;
+    const geo = new THREE.SphereGeometry(size, 8, 6);
+    const mat = new THREE.MeshBasicMaterial({
+      color: cloudColors[Math.floor(Math.random() * cloudColors.length)],
+      transparent: true, opacity: 0.65, depthWrite: false,
+    });
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set((Math.random() - 0.5) * 10, 5 + Math.random() * 25, (Math.random() - 0.5) * 10);
+    m.userData = { type: 'stem', riseSpeed: 1 + Math.random() * 2, drift: (Math.random() - 0.5) * 0.5 };
+    scene.add(m);
+    mushroomCloud.push(m);
+  }
+
+  // Cap particles
+  for (let i = 0; i < 60; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const r = 5 + Math.random() * 20;
+    const size = 3 + Math.random() * 7;
+    const geo = new THREE.SphereGeometry(size, 8, 6);
+    const mat = new THREE.MeshBasicMaterial({
+      color: cloudColors[Math.floor(Math.random() * cloudColors.length)],
+      transparent: true, opacity: 0.55, depthWrite: false,
+    });
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(Math.cos(a) * r, 35 + Math.random() * 25, Math.sin(a) * r);
+    m.userData = { type: 'cap', angle: a, radius: r, riseSpeed: 0.3 + Math.random() * 0.7, expandRate: 0.5 + Math.random() };
+    scene.add(m);
+    mushroomCloud.push(m);
+  }
+}
+
+function createDebrisBurst() {
+  const count = 3000;
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(count * 3);
+  const vel = [];
+
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const el = Math.random() * Math.PI * 0.5;
+    const speed = 3 + Math.random() * 12;
+
+    pos[i * 3] = 0;
+    pos[i * 3 + 1] = 2;
+    pos[i * 3 + 2] = 0;
+
+    vel.push({
+      x: Math.cos(a) * Math.cos(el) * speed,
+      y: Math.sin(el) * speed + 3,
+      z: Math.sin(a) * Math.cos(el) * speed,
+      gravity: -9.8,
+      life: 1.0,
+      decay: 0.002 + Math.random() * 0.004,
+    });
+  }
+
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({
+    color: 0xff6633, size: 1.2, transparent: true, opacity: 0.8, depthWrite: false,
+  });
+  debrisParticles = new THREE.Points(geo, mat);
+  debrisParticles.userData.velocities = vel;
+  scene.add(debrisParticles);
+}
+
+function createGroundSmoke() {
+  // Rising smoke plumes from blast zone
+  for (let i = 0; i < 40; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const r = Math.random() * 60;
+    const size = 4 + Math.random() * 8;
+    const geo = new THREE.SphereGeometry(size, 8, 6);
+    const darkness = 0.1 + Math.random() * 0.15;
+    const mat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(darkness, darkness, darkness * 0.8),
+      transparent: true, opacity: 0.3, depthWrite: false,
+    });
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(Math.cos(a) * r, Math.random() * 5, Math.sin(a) * r);
+    m.userData = {
+      riseSpeed: 1 + Math.random() * 3,
+      expandRate: 0.3 + Math.random() * 0.5,
+      drift: (Math.random() - 0.5) * 2,
+    };
+    scene.add(m);
+    groundSmoke.push(m);
+  }
+}
+
+function createGroundFire() {
+  // Fire patches on the ground
+  const fireColors = [0xff4400, 0xff6600, 0xff8800, 0xff2200];
+  for (let i = 0; i < 25; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const r = 5 + Math.random() * 70;
+    const size = 1 + Math.random() * 3;
+    const geo = new THREE.SphereGeometry(size, 8, 6);
+    const color = fireColors[Math.floor(Math.random() * fireColors.length)];
+    const mat = new THREE.MeshBasicMaterial({
+      color: color, transparent: true, opacity: 0.7, depthWrite: false,
+    });
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(Math.cos(a) * r, 0.5, Math.sin(a) * r);
+    m.userData = {
+      flickerSpeed: 5 + Math.random() * 6,
+      flickerPhase: Math.random() * Math.PI * 2,
+      baseY: 0.5,
+      lifetime: 3 + Math.random() * 7,
+    };
+    scene.add(m);
+    groundFire.push(m);
+  }
+}
+
+function createSparkBurst() {
+  const count = 800;
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(count * 3);
+  const colors = new Float32Array(count * 3);
+  const vel = [];
+
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const el = Math.random() * Math.PI * 0.6;
+    const speed = 5 + Math.random() * 20;
+
+    pos[i * 3] = 0;
+    pos[i * 3 + 1] = 3;
+    pos[i * 3 + 2] = 0;
+
+    const temp = Math.random();
+    if (temp < 0.33) { colors[i*3]=1; colors[i*3+1]=0.9; colors[i*3+2]=0.5; }
+    else if (temp < 0.66) { colors[i*3]=1; colors[i*3+1]=0.5; colors[i*3+2]=0.1; }
+    else { colors[i*3]=0.8; colors[i*3+1]=0.2; colors[i*3+2]=0.05; }
+
+    vel.push({
+      x: Math.cos(a) * Math.cos(el) * speed,
+      y: Math.sin(el) * speed + 5,
+      z: Math.sin(a) * Math.cos(el) * speed,
+      gravity: -15,
+      life: 1.0,
+      decay: 0.008 + Math.random() * 0.012,
+    });
+  }
+
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  const mat = new THREE.PointsMaterial({
+    size: 2, transparent: true, opacity: 1, depthWrite: false,
+    vertexColors: true, blending: THREE.AdditiveBlending,
+  });
+  sparkParticles = new THREE.Points(geo, mat);
+  sparkParticles.userData.velocities = vel;
+  scene.add(sparkParticles);
+}
+
+// ============================================================
+// UPDATE LOOP
+// ============================================================
+function animate() {
+  requestAnimationFrame(animate);
+
+  const dt = Math.min(clock.getDelta(), 0.033); // cap at ~30fps step
+
+  // Physics step
+  if (world) {
+    world.step(1 / 60, dt, 8); // even more substeps for faster collision resolution
+  }
+
+  // Sync rigid bodies with meshes
+  syncPhysics();
+
+  // Chain-reaction pass: wake sleeping blocks whose neighbors are flying
+  if (explosionActive) {
+    propagateChainReaction();
+  }
+
+  if (explosionActive) {
+    explosionTime += dt;
+    processBlastQueue();
+    updateExplosionEffects(dt);
+  }
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+function syncPhysics() {
+  let flyingCount = 0;
+  let restingCount = 0;
+
+  for (let i = 0; i < buildingBlocks.length; i++) {
+    const block = buildingBlocks[i];
+    const body = block.body;
+    const mesh = block.mesh;
+
+    mesh.position.copy(body.position);
+    mesh.quaternion.copy(body.quaternion);
+
+    // Chain reaction: if a SLEEPING block was woken by collision,
+    // debris hit it — transition to FLYING so it tumbles realistically
+    if (block.state === 'SLEEPING' && body.sleepState !== CANNON.Body.SLEEPING) {
+      block.state = 'FLYING';
+      block.heatLevel = 0.2;
+      flyingCount++;
+    }
+
+    // Heat glow on window overlays
+    if ((block.state === 'FLYING' || block.state === 'WAKING') && block.heatLevel > 0 && mesh.children) {
+      const heatFade = block.heatLevel * (1 - Math.min(1, explosionTime / 6));
+      mesh.children.forEach(child => {
+        if (child.material && child.material.transparent && child.material.depthWrite === false) {
+          const r = Math.min(1, 0.5 + heatFade * 0.5);
+          const g = Math.max(0, 0.3 - heatFade * 0.3);
+          const b = Math.max(0, 0.4 - heatFade * 0.4);
+          child.material.color.setRGB(r, g, b);
+          child.material.opacity = Math.min(0.6, 0.15 + heatFade * 0.5);
+        }
+      });
+    }
+
+    if (block.state === 'FLYING') {
+      const vel = body.velocity.length();
+      const angVel = body.angularVelocity.length();
+
+      if (vel < 0.1 && angVel < 0.3 && body.position.y < 0.5) {
+        block.state = 'RESTED';
+        restingCount++;
+      }
+      flyingCount++;
+    }
+  }
+
+  // Update destroyed count
+  const newDestroyed = buildingBlocks.filter(b => b.state !== 'SLEEPING').length;
+  if (newDestroyed !== destroyedCount) {
+    destroyedCount = newDestroyed;
+    document.getElementById('hud-destroyed').textContent = `DESTROYED: ${destroyedCount} / ${totalBodies}`;
+  }
+}
+
+function updateExplosionEffects(dt) {
+  const t = explosionTime;
+
+  // --- Fireball ---
+  if (fireballMesh) {
+    const scale = Math.min(3 + t * 50, 55);
+    fireballMesh.scale.set(scale, scale, scale);
+    fireballMesh.position.y = 2 + scale * 0.15;
+
+    const fade = Math.min(t / 3, 1);
+    const r = 1.0;
+    const g = 1.0 - fade * 0.75;
+    const b = 1.0 - fade;
+    fireballMesh.material.color.setRGB(r, g, b);
+    fireballMesh.material.opacity = Math.max(0.15, 1.0 - fade * 0.85);
+
+    if (innerFireball) {
+      innerFireball.scale.set(scale * 0.6, scale * 0.6, scale * 0.6);
+      innerFireball.position.y = fireballMesh.position.y;
+    }
+  }
+
+  // --- Shockwave ---
+  if (shockwaveMesh) {
+    const radius = 2 + t * 150;
+    shockwaveMesh.geometry.dispose();
+    shockwaveMesh.geometry = new THREE.RingGeometry(Math.max(1, radius - 12), radius, 64);
+    shockwaveMesh.material.opacity = Math.max(0, 0.7 - t * 0.15);
+
+    if (shockwaveWall) {
+      const wallH = Math.max(3, 70 - t * 10);
+      shockwaveWall.geometry.dispose();
+      shockwaveWall.geometry = new THREE.CylinderGeometry(radius, radius, wallH, 64, 1, true);
+      shockwaveWall.material.opacity = Math.max(0, 0.25 - t * 0.06);
+      shockwaveWall.position.y = wallH / 2;
+    }
+  }
+
+  // --- Mushroom cloud ---
+  mushroomCloud.forEach(c => {
+    const ud = c.userData;
+    c.position.y += ud.riseSpeed * dt * 6;
+    c.position.x += ud.drift * dt;
+    c.scale.multiplyScalar(1 + dt * 1.0);
+    c.material.opacity = Math.max(0.05, c.material.opacity - dt * 0.04);
+
+    if (ud.type === 'cap') {
+      ud.radius += ud.expandRate * dt;
+      c.position.x = Math.cos(ud.angle) * ud.radius;
+      c.position.z = Math.sin(ud.angle) * ud.radius;
+    }
+  });
+
+  // --- Debris particles ---
+  if (debrisParticles) {
+    const pos = debrisParticles.geometry.attributes.position;
+    const vel = debrisParticles.userData.velocities;
+    for (let i = 0; i < vel.length; i++) {
+      const v = vel[i];
+      v.y += v.gravity * dt;
+      v.life -= v.decay;
+      if (v.life > 0) {
+        pos.array[i*3] += v.x * dt;
+        pos.array[i*3+1] += v.y * dt;
+        pos.array[i*3+2] += v.z * dt;
+      } else {
+        pos.array[i*3+1] = -9999;
+      }
+    }
+    pos.needsUpdate = true;
+  }
+
+  // --- Spark particles ---
+  if (sparkParticles) {
+    const pos = sparkParticles.geometry.attributes.position;
+    const vel = sparkParticles.userData.velocities;
+    for (let i = 0; i < vel.length; i++) {
+      const v = vel[i];
+      v.y += v.gravity * dt;
+      v.life -= v.decay;
+      if (v.life > 0) {
+        pos.array[i*3] += v.x * dt;
+        pos.array[i*3+1] += v.y * dt;
+        pos.array[i*3+2] += v.z * dt;
+      } else {
+        pos.array[i*3+1] = -9999;
+      }
+    }
+    pos.needsUpdate = true;
+  }
+
+  // --- Explosion lights ---
+  if (explosionLight) {
+    explosionLight.intensity = Math.max(0, 80 - t * 15);
+    explosionLight.position.y = fireballMesh ? fireballMesh.position.y : 5;
+  }
+  if (explosionLight2) {
+    explosionLight2.intensity = Math.max(0, 40 - t * 10);
+  }
+
+  // --- Camera shake ---
+  if (t < 2) {
+    const shake = (1 - t / 2) * 2.5;
+    camera.position.x += (Math.random() - 0.5) * shake;
+    camera.position.y += (Math.random() - 0.5) * shake * 0.7;
+    camera.position.z += (Math.random() - 0.5) * shake;
+  }
+
+  // --- Ground smoke ---
+  groundSmoke.forEach(smoke => {
+    const ud = smoke.userData;
+    smoke.position.y += ud.riseSpeed * dt * 4;
+    smoke.position.x += ud.drift * dt;
+    smoke.scale.multiplyScalar(1 + ud.expandRate * dt * 1.5);
+    smoke.material.opacity = Math.max(0, smoke.material.opacity - dt * 0.025);
+  });
+
+  // --- Ground fire ---
+  groundFire.forEach(fire => {
+    const ud = fire.userData;
+    const flicker = Math.sin(t * ud.flickerSpeed + ud.flickerPhase);
+    fire.scale.setScalar(0.7 + flicker * 0.3);
+    fire.material.opacity = Math.max(0, 0.7 + flicker * 0.3 - t * 0.02);
+    fire.position.y = ud.baseY + Math.abs(flicker) * 0.5;
+  });
+
+  // --- Ground crater ---
+  if (t < 3) {
+    updateGroundCrater(t);
+  }
+}
+
+function updateGroundCrater(t) {
+  if (!groundMesh) return;
+  const pos = groundMesh.geometry.attributes.position;
+  if (!pos) return;
+  const radius = t * 60;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    const z = pos.getZ(i);
+    const d = Math.sqrt(x * x + z * z);
+    if (d < radius && d > 0) {
+      const craterDepth = Math.max(0, (1 - d / radius)) * 4 * Math.sin(Math.PI * d / radius);
+      pos.setY(i, -craterDepth);
+    }
+  }
+  pos.needsUpdate = true;
+  groundMesh.geometry.computeVertexNormals();
+}
+
+function onResize() {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}
+
+// ============================================================
+// START
+// ============================================================
+init();
+</script>
+</body>
+</html>
